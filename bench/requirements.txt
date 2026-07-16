@@ -1,0 +1,4 @@
+numpy
+maturin>=1.5
+faiss-cpu
+matplotlib

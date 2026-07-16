@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["vektordb-core", "vektordb-cli", "vektordb-py"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

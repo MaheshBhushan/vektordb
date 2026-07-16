@@ -1,0 +1,15 @@
+[package]
+name = "vektordb-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vektordb"
+crate-type = ["cdylib"]
+
+[dependencies]
+vektordb-core = { path = "../vektordb-core" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+numpy = "0.22"
+rayon = "1.10"

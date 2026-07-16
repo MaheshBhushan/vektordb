@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vektordb"
+description = "A vector database built from first principles: HNSW + PQ + mmap + WAL"
+requires-python = ">=3.8"
+classifiers = ["Programming Language :: Rust"]
+dynamic = ["version"]
+
+[tool.maturin]
+# The crate lives in this subdir; the workspace root is one level up.
+manifest-path = "Cargo.toml"
+module-name = "vektordb"
