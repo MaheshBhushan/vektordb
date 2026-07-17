@@ -1,5 +1,7 @@
 # vektordb
 
+![Rust](https://img.shields.io/badge/Rust-000000?style=flat&logo=rust&logoColor=white) ![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+
 A vector database built from first principles, in Rust — not a wrapper around
 an existing ANN library. The point is to build the retrieval infrastructure
 itself: the graph index, the on-disk storage, the compression, the distance
