@@ -43,13 +43,7 @@ impl ProductQuantizer {
 
     /// Train codebooks on `samples` (row-major, `dim` floats each).
     /// `dim` must be divisible by `m`.
-    pub fn train<R: Rng>(
-        samples: &[f32],
-        dim: usize,
-        m: usize,
-        iters: usize,
-        rng: &mut R,
-    ) -> Self {
+    pub fn train<R: Rng>(samples: &[f32], dim: usize, m: usize, iters: usize, rng: &mut R) -> Self {
         assert!(dim % m == 0, "dim {dim} not divisible by m {m}");
         assert!(!samples.is_empty() && samples.len() % dim == 0);
         let n = samples.len() / dim;
@@ -75,7 +69,12 @@ impl ProductQuantizer {
             })
             .collect();
 
-        Self { dim, m, sub_dim, centroids }
+        Self {
+            dim,
+            m,
+            sub_dim,
+            centroids,
+        }
     }
 
     /// Quantize `v` into `out` (`m` bytes).
@@ -136,7 +135,12 @@ impl ProductQuantizer {
         if dim == 0 || m == 0 || sub_dim * m != dim || centroids.len() != m * K * sub_dim {
             return None;
         }
-        Some(Self { dim, m, sub_dim, centroids })
+        Some(Self {
+            dim,
+            m,
+            sub_dim,
+            centroids,
+        })
     }
 }
 
@@ -254,7 +258,9 @@ mod tests {
         (0..n)
             .flat_map(|_| {
                 let c = &centers[rng.gen_range(0..centers.len())];
-                c.iter().map(|x| x + rng.gen_range(-0.3..0.3)).collect::<Vec<f32>>()
+                c.iter()
+                    .map(|x| x + rng.gen_range(-0.3..0.3))
+                    .collect::<Vec<f32>>()
             })
             .collect()
     }

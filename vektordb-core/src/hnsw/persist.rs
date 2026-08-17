@@ -88,7 +88,10 @@ impl Hnsw {
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        let mut w = CrcWriter { inner: BufWriter::new(file), hasher: crc32fast::Hasher::new() };
+        let mut w = CrcWriter {
+            inner: BufWriter::new(file),
+            hasher: crc32fast::Hasher::new(),
+        };
 
         w.put(&MAGIC.to_le_bytes())?;
         w.put(&VERSION.to_le_bytes())?;
@@ -107,7 +110,11 @@ impl Hnsw {
             w.put(&(node.level() as u32).to_le_bytes())?;
             for layer in 0..=node.level() {
                 let p = node.links[layer].load(Ordering::Acquire, &guard);
-                let links: &[u64] = if p.is_null() { &[] } else { unsafe { p.deref() } };
+                let links: &[u64] = if p.is_null() {
+                    &[]
+                } else {
+                    unsafe { p.deref() }
+                };
                 w.put(&(links.len() as u32).to_le_bytes())?;
                 for &nb in links {
                     w.put(&nb.to_le_bytes())?;
@@ -117,7 +124,10 @@ impl Hnsw {
 
         let crc = w.hasher.clone().finalize();
         w.inner.write_all(&crc.to_le_bytes())?;
-        let file = w.inner.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        let file = w
+            .inner
+            .into_inner()
+            .map_err(|e| Error::Io(e.into_error()))?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)?;
@@ -132,7 +142,10 @@ impl Hnsw {
     /// should resume from.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<(Hnsw, u64)> {
         let file = File::open(path)?;
-        let mut r = CrcReader { inner: BufReader::new(file), hasher: crc32fast::Hasher::new() };
+        let mut r = CrcReader {
+            inner: BufReader::new(file),
+            hasher: crc32fast::Hasher::new(),
+        };
 
         if r.u32()? != MAGIC {
             return Err(Error::Corrupt("snapshot: bad magic".into()));
@@ -147,7 +160,11 @@ impl Hnsw {
         let count = r.u64()?;
         let entry = r.u64()?;
 
-        let index = Hnsw::new(HnswConfig { m, ef_construction, metric });
+        let index = Hnsw::new(HnswConfig {
+            m,
+            ef_construction,
+            metric,
+        });
         let guard = epoch::pin();
         for i in 0..count {
             let level = r.u32()? as usize;
@@ -205,7 +222,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), 12).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(5);
-        let index = Hnsw::new(HnswConfig { m: 8, ef_construction: 64, metric: Metric::L2 });
+        let index = Hnsw::new(HnswConfig {
+            m: 8,
+            ef_construction: 64,
+            metric: Metric::L2,
+        });
         for i in 0..2000 {
             let v: Vec<f32> = (0..12).map(|j| ((i * 12 + j) % 97) as f32 * 0.1).collect();
             let id = store.append(&v).unwrap();
@@ -243,6 +264,9 @@ mod tests {
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
         std::fs::write(&snap, &bytes).unwrap();
-        assert!(Hnsw::load(&snap).is_err(), "bit flip must not load silently");
+        assert!(
+            Hnsw::load(&snap).is_err(),
+            "bit flip must not load silently"
+        );
     }
 }

@@ -39,9 +39,18 @@ pub unsafe fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0usize;
     while i + 32 <= n {
         let d0 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
-        let d1 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)));
-        let d2 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 16)), _mm256_loadu_ps(pb.add(i + 16)));
-        let d3 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 24)), _mm256_loadu_ps(pb.add(i + 24)));
+        let d1 = _mm256_sub_ps(
+            _mm256_loadu_ps(pa.add(i + 8)),
+            _mm256_loadu_ps(pb.add(i + 8)),
+        );
+        let d2 = _mm256_sub_ps(
+            _mm256_loadu_ps(pa.add(i + 16)),
+            _mm256_loadu_ps(pb.add(i + 16)),
+        );
+        let d3 = _mm256_sub_ps(
+            _mm256_loadu_ps(pa.add(i + 24)),
+            _mm256_loadu_ps(pb.add(i + 24)),
+        );
         acc0 = _mm256_fmadd_ps(d0, d0, acc0);
         acc1 = _mm256_fmadd_ps(d1, d1, acc1);
         acc2 = _mm256_fmadd_ps(d2, d2, acc2);
@@ -53,7 +62,10 @@ pub unsafe fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
         acc0 = _mm256_fmadd_ps(d, d, acc0);
         i += 8;
     }
-    let mut sum = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
+    let mut sum = hsum256(_mm256_add_ps(
+        _mm256_add_ps(acc0, acc1),
+        _mm256_add_ps(acc2, acc3),
+    ));
     while i < n {
         let d = *pa.add(i) - *pb.add(i);
         sum += d * d;
@@ -76,16 +88,31 @@ pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0usize;
     while i + 32 <= n {
         acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
-        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)), acc1);
-        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 16)), _mm256_loadu_ps(pb.add(i + 16)), acc2);
-        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 24)), _mm256_loadu_ps(pb.add(i + 24)), acc3);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 8)),
+            _mm256_loadu_ps(pb.add(i + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 16)),
+            _mm256_loadu_ps(pb.add(i + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 24)),
+            _mm256_loadu_ps(pb.add(i + 24)),
+            acc3,
+        );
         i += 32;
     }
     while i + 8 <= n {
         acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
         i += 8;
     }
-    let mut sum = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
+    let mut sum = hsum256(_mm256_add_ps(
+        _mm256_add_ps(acc0, acc1),
+        _mm256_add_ps(acc2, acc3),
+    ));
     while i < n {
         sum += *pa.add(i) * *pb.add(i);
         i += 1;

@@ -73,7 +73,14 @@ impl Wal {
             file.sync_data()?;
         }
         file.seek(SeekFrom::Start(good_end))?;
-        Ok((Self { file, policy, next_lsn }, records))
+        Ok((
+            Self {
+                file,
+                policy,
+                next_lsn,
+            },
+            records,
+        ))
     }
 
     pub fn next_lsn(&self) -> u64 {
@@ -179,7 +186,10 @@ mod tests {
     use super::*;
 
     fn op(id: u64) -> WalOp {
-        WalOp::Insert { id, vector: vec![id as f32; 8] }
+        WalOp::Insert {
+            id,
+            vector: vec![id as f32; 8],
+        }
     }
 
     #[test]
@@ -259,7 +269,11 @@ mod tests {
             wal.append(&op(i)).unwrap();
         }
         wal.reset().unwrap();
-        assert_eq!(wal.append(&op(100)).unwrap(), 5, "LSNs continue after reset");
+        assert_eq!(
+            wal.append(&op(100)).unwrap(),
+            5,
+            "LSNs continue after reset"
+        );
         drop(wal);
         let (_, recs) = Wal::open(&path, SyncPolicy::Always).unwrap();
         assert_eq!(recs.len(), 1);

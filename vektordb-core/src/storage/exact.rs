@@ -65,7 +65,14 @@ pub fn search(store: &VectorStore, query: &[f32], k: usize, metric: Metric) -> V
             let mut heap = BinaryHeap::with_capacity(k + 1);
             for id in start..end {
                 let v = unsafe { store.get_unchecked(id) };
-                push_bounded(&mut heap, Neighbor { id, distance: kernel(query, v) }, k);
+                push_bounded(
+                    &mut heap,
+                    Neighbor {
+                        id,
+                        distance: kernel(query, v),
+                    },
+                    k,
+                );
             }
             heap
         })
@@ -108,7 +115,10 @@ mod tests {
             let mut naive: Vec<Neighbor> = all
                 .iter()
                 .enumerate()
-                .map(|(i, v)| Neighbor { id: i as u64, distance: kernel(&query, v) })
+                .map(|(i, v)| Neighbor {
+                    id: i as u64,
+                    distance: kernel(&query, v),
+                })
                 .collect();
             naive.sort();
             naive.truncate(10);

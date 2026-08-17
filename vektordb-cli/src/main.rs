@@ -45,10 +45,9 @@ fn main() {
             args[3].parse().unwrap_or_else(|_| usage()),
             args[4].parse().unwrap_or_else(|_| usage()),
         ),
-        "orphans" if args.len() == 4 => orphans(
-            &args[2],
-            args[3].parse().unwrap_or_else(|_| usage()),
-        ),
+        "orphans" if args.len() == 4 => {
+            orphans(&args[2], args[3].parse().unwrap_or_else(|_| usage()))
+        }
         "search" if args.len() == 6 => search(
             &args[2],
             args[3].parse().unwrap_or_else(|_| usage()),

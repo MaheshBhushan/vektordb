@@ -103,7 +103,12 @@ impl VectorStore {
         if file.metadata()?.len() < end {
             file.set_len(end)?;
         }
-        Ok(unsafe { MmapOptions::new().offset(byte_offset).len(len).map_mut(file)? })
+        Ok(unsafe {
+            MmapOptions::new()
+                .offset(byte_offset)
+                .len(len)
+                .map_mut(file)?
+        })
     }
 
     /// Create a new store file (truncating any existing one).
@@ -117,8 +122,11 @@ impl VectorStore {
             .open(path)?;
         let row_stride = (dim * 4).div_ceil(ROW_ALIGN) * ROW_ALIGN;
         file.set_len(HEADER_SIZE)?;
-        let mut header =
-            unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file)? };
+        let mut header = unsafe {
+            MmapOptions::new()
+                .len(HEADER_SIZE as usize)
+                .map_mut(&file)?
+        };
         header[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         header[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
         header[OFF_DIM..OFF_DIM + 4].copy_from_slice(&(dim as u32).to_le_bytes());
@@ -144,8 +152,11 @@ impl VectorStore {
         if file.metadata()?.len() < HEADER_SIZE {
             return Err(Error::Corrupt("file smaller than header".into()));
         }
-        let header =
-            unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file)? };
+        let header = unsafe {
+            MmapOptions::new()
+                .len(HEADER_SIZE as usize)
+                .map_mut(&file)?
+        };
         if read_u32(&header, OFF_MAGIC) != MAGIC {
             return Err(Error::Corrupt("bad magic".into()));
         }
@@ -209,7 +220,10 @@ impl VectorStore {
     /// Append a vector, returning its id. Callable from any thread.
     pub fn append(&self, vector: &[f32]) -> Result<u64> {
         if vector.len() != self.dim {
-            return Err(Error::DimensionMismatch { expected: self.dim, got: vector.len() });
+            return Err(Error::DimensionMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
         }
         let mut app = self.appender.lock();
         let id = self.count.load(Ordering::Relaxed);
@@ -345,7 +359,8 @@ mod tests {
     #[test]
     fn concurrent_append_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(VectorStore::create(dir.path().join("v.store"), 16).unwrap());
+        let store =
+            std::sync::Arc::new(VectorStore::create(dir.path().join("v.store"), 16).unwrap());
         let n_writers = 4;
         let per_writer = 2000;
 

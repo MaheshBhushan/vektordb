@@ -12,7 +12,10 @@ pub struct VisitedSet {
 
 impl VisitedSet {
     pub fn new() -> Self {
-        Self { stamps: Vec::new(), generation: 0 }
+        Self {
+            stamps: Vec::new(),
+            generation: 0,
+        }
     }
 
     /// Start a new traversal over a graph of `n` nodes.
