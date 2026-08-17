@@ -44,8 +44,8 @@ impl ProductQuantizer {
     /// Train codebooks on `samples` (row-major, `dim` floats each).
     /// `dim` must be divisible by `m`.
     pub fn train<R: Rng>(samples: &[f32], dim: usize, m: usize, iters: usize, rng: &mut R) -> Self {
-        assert!(dim % m == 0, "dim {dim} not divisible by m {m}");
-        assert!(!samples.is_empty() && samples.len() % dim == 0);
+        assert!(dim.is_multiple_of(m), "dim {dim} not divisible by m {m}");
+        assert!(!samples.is_empty() && samples.len().is_multiple_of(dim));
         let n = samples.len() / dim;
         assert!(n >= K, "need at least {K} training vectors, got {n}");
         let sub_dim = dim / m;
@@ -62,7 +62,7 @@ impl ProductQuantizer {
                 let points: Vec<f32> = (0..n)
                     .flat_map(|i| {
                         let row = &samples[i * dim + sub * sub_dim..][..sub_dim];
-                        row.iter().copied().collect::<Vec<_>>()
+                        row.to_vec()
                     })
                     .collect();
                 kmeans(&points, n, sub_dim, iters, &mut rng)
@@ -99,8 +99,8 @@ impl ProductQuantizer {
     /// Reconstruct the centroid approximation of a code (tests/debugging).
     pub fn decode(&self, code: &[u8]) -> Vec<f32> {
         let mut v = Vec::with_capacity(self.dim);
-        for sub in 0..self.m {
-            v.extend_from_slice(self.centroid(sub, code[sub] as usize));
+        for (sub, &c) in code[..self.m].iter().enumerate() {
+            v.extend_from_slice(self.centroid(sub, c as usize));
         }
         v
     }
@@ -112,8 +112,8 @@ impl ProductQuantizer {
         for sub in 0..self.m {
             let q = &query[sub * self.sub_dim..][..self.sub_dim];
             let row = &mut table[sub * K..][..K];
-            for k in 0..K {
-                row[k] = l2_squared(q, self.centroid(sub, k));
+            for (k, slot) in row.iter_mut().enumerate() {
+                *slot = l2_squared(q, self.centroid(sub, k));
             }
         }
         table
@@ -196,10 +196,10 @@ fn kmeans<R: Rng>(points: &[f32], n: usize, d: usize, iters: usize, rng: &mut R)
         let start = centroids.len();
         centroids.extend_from_slice(row(pick));
         let new_c = &centroids[start..];
-        for i in 0..n {
+        for (i, nearest) in d2.iter_mut().enumerate() {
             let dd = l2_squared(row(i), new_c);
-            if dd < d2[i] {
-                d2[i] = dd;
+            if dd < *nearest {
+                *nearest = dd;
             }
         }
     }
@@ -207,7 +207,7 @@ fn kmeans<R: Rng>(points: &[f32], n: usize, d: usize, iters: usize, rng: &mut R)
     // Lloyd iterations.
     let mut assign = vec![0usize; n];
     for _ in 0..iters {
-        for i in 0..n {
+        for (i, slot) in assign.iter_mut().enumerate() {
             let mut best = 0;
             let mut best_d = f32::INFINITY;
             for k in 0..K {
@@ -217,7 +217,7 @@ fn kmeans<R: Rng>(points: &[f32], n: usize, d: usize, iters: usize, rng: &mut R)
                     best = k;
                 }
             }
-            assign[i] = best;
+            *slot = best;
         }
         let mut sums = vec![0.0f64; K * d];
         let mut counts = vec![0u32; K];
