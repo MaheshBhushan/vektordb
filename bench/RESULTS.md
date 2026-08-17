@@ -2,12 +2,11 @@
 
 **The honest summary:** vektordb's HNSW matches FAISS on **recall@10 at every
 efSearch** — unsurprising, since it's the same algorithm implemented from the
-same paper — and FAISS is roughly **2–3× faster on throughput**. That gap is
-real and expected: FAISS has years of kernel and graph-layout tuning behind
-it. What this project demonstrates is that a from-scratch HNSW + mmap + PQ +
-WAL stack lands on the *same recall/latency Pareto frontier*, within a small
-constant factor on speed, while also giving crash durability that a pure
-in-memory library does not.
+same paper. On throughput **neither engine dominates**: FAISS is faster below
+ef≈48, where its leaner per-query setup wins, and vektordb is faster from
+ef=64 upward, up to **1.8× FAISS's QPS at ef=512**. The two land on the *same
+recall/throughput Pareto frontier*, which is the outcome that matters here —
+plus crash durability that a pure in-memory library does not offer.
 
 Everything below is produced by `bench/run.py`, which drives both engines
 through identical numpy arrays, ground truth, timing code, and efSearch sweep.
