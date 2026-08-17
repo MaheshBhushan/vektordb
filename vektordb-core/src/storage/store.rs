@@ -166,7 +166,7 @@ impl VectorStore {
         let dim = read_u32(&header, OFF_DIM) as usize;
         let row_stride = read_u64(&header, OFF_STRIDE) as usize;
         let count = read_u64(&header, OFF_COUNT);
-        if dim == 0 || row_stride < dim * 4 || row_stride % ROW_ALIGN != 0 {
+        if dim == 0 || row_stride < dim * 4 || !row_stride.is_multiple_of(ROW_ALIGN) {
             return Err(Error::Corrupt("inconsistent header geometry".into()));
         }
 
@@ -179,7 +179,7 @@ impl VectorStore {
             count: AtomicU64::new(count),
         };
         // Map every segment that contains existing rows (plus segment 0).
-        let (last_seg, _) = locate(count.saturating_sub(1).max(0));
+        let (last_seg, _) = locate(count.saturating_sub(1));
         let needed = if count == 0 { 1 } else { last_seg + 1 };
         store.ensure_mapped_locked(&mut store.appender.lock(), needed)?;
         Ok(store)

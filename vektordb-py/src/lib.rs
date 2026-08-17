@@ -4,6 +4,14 @@
 //! boundary zero-copy where possible; the heavy calls (`add`, `search`,
 //! `train_pq`) release the GIL so a Python benchmark harness can drive this
 //! and FAISS through identical code paths and thread pools.
+//!
+//! `useless_conversion` is allowed crate-wide because pyo3 0.22's
+//! `#[pymethods]` expansion converts every `PyResult` error with an `.into()`
+//! that is a no-op when the error is already a `PyErr`. Clippy blames our
+//! return types, where there is nothing to remove, and macro hygiene means
+//! neither an impl-level nor a per-method allow suppresses it (both tried).
+//! Revisit when pyo3 is upgraded.
+#![allow(clippy::useless_conversion)]
 
 use numpy::prelude::*;
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -18,6 +26,9 @@ use vektordb_core::{Db, DbOptions};
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
+
+/// `(ids, distances)`, both shape `(nq, k)` — what every search returns.
+type Neighbors<'py> = (Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>);
 
 /// A vektordb index backed by a directory on disk.
 ///
@@ -91,7 +102,7 @@ impl VektorDb {
         queries: PyReadonlyArray2<'py, f32>,
         k: usize,
         ef: usize,
-    ) -> PyResult<(Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>)> {
+    ) -> PyResult<Neighbors<'py>> {
         if queries.shape()[1] != self.dim {
             return Err(PyValueError::new_err("query dim mismatch"));
         }
@@ -130,7 +141,7 @@ impl VektorDb {
         k: usize,
         ef: usize,
         rerank: usize,
-    ) -> PyResult<(Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>)> {
+    ) -> PyResult<Neighbors<'py>> {
         if queries.shape()[1] != self.dim {
             return Err(PyValueError::new_err("query dim mismatch"));
         }
@@ -203,9 +214,7 @@ fn rows_u64(
     n: usize,
     k: usize,
 ) -> PyResult<Bound<'_, PyArray2<u64>>> {
-    PyArray1::from_slice_bound(py, &flat)
-        .reshape([n, k])
-        .map_err(Into::into)
+    PyArray1::from_slice_bound(py, &flat).reshape([n, k])
 }
 
 fn rows_f32(
@@ -214,9 +223,7 @@ fn rows_f32(
     n: usize,
     k: usize,
 ) -> PyResult<Bound<'_, PyArray2<f32>>> {
-    PyArray1::from_slice_bound(py, &flat)
-        .reshape([n, k])
-        .map_err(Into::into)
+    PyArray1::from_slice_bound(py, &flat).reshape([n, k])
 }
 
 #[pymodule]

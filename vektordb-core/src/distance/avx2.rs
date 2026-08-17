@@ -25,6 +25,15 @@ unsafe fn hsum256(v: __m256) -> f32 {
     _mm_cvtss_f32(s)
 }
 
+/// Squared L2 distance between `a` and `b`.
+///
+/// # Safety
+///
+/// - AVX2 and FMA must be available on the running CPU. Use
+///   [`Metric::kernel`](crate::distance::Metric::kernel), which feature-detects
+///   once, rather than calling this directly.
+/// - `a.len()` must equal `b.len()`. The lengths are only `debug_assert`ed, so
+///   in release builds a shorter `b` reads out of bounds.
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -74,6 +83,13 @@ pub unsafe fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Dot product of `a` and `b`.
+///
+/// # Safety
+///
+/// Same contract as [`l2_squared`]: AVX2+FMA must be available on the running
+/// CPU, and `a.len()` must equal `b.len()` (only `debug_assert`ed, so a
+/// mismatch reads out of bounds in release builds).
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -120,6 +136,13 @@ pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Cosine similarity of `a` and `b`, computed in one pass.
+///
+/// # Safety
+///
+/// Same contract as [`l2_squared`]: AVX2+FMA must be available on the running
+/// CPU, and `a.len()` must equal `b.len()` (only `debug_assert`ed, so a
+/// mismatch reads out of bounds in release builds).
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());

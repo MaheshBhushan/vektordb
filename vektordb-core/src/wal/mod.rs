@@ -57,15 +57,10 @@ impl Wal {
         {
             let len = file.metadata()?.len();
             let mut reader = BufReader::new(&mut file);
-            loop {
-                match read_record(&mut reader, len, good_end) {
-                    Some((consumed, lsn, op)) => {
-                        good_end += consumed;
-                        next_lsn = next_lsn.max(lsn + 1);
-                        records.push((lsn, op));
-                    }
-                    None => break,
-                }
+            while let Some((consumed, lsn, op)) = read_record(&mut reader, len, good_end) {
+                good_end += consumed;
+                next_lsn = next_lsn.max(lsn + 1);
+                records.push((lsn, op));
             }
         }
         if file.metadata()?.len() > good_end {
