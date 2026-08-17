@@ -18,7 +18,13 @@ fn bin() -> &'static str {
 /// earlier cycles; ingest resumes from the recovered length, which may
 /// exceed it (an insert can be durable even if its ACK line never reached
 /// us before the kill). Returns the new proven-durable count.
-fn crash_cycle(dir: &std::path::Path, target: u64, kill_after_ms: u64, checkpoint_every: Option<u64>, floor: u64) -> u64 {
+fn crash_cycle(
+    dir: &std::path::Path,
+    target: u64,
+    kill_after_ms: u64,
+    checkpoint_every: Option<u64>,
+    floor: u64,
+) -> u64 {
     let mut cmd = Command::new(bin());
     cmd.arg("ingest")
         .arg(dir)
@@ -97,7 +103,10 @@ fn survives_sigkill_at_random_points() {
         let checkpoint_every = if i % 3 == 2 { Some(500) } else { None };
         total_acked = crash_cycle(&dir, 1_000_000, ms, checkpoint_every, total_acked);
     }
-    assert!(total_acked > 0, "no cycle acked anything — kill points too early");
+    assert!(
+        total_acked > 0,
+        "no cycle acked anything — kill points too early"
+    );
 }
 
 #[test]
@@ -119,5 +128,9 @@ fn clean_run_completes_and_verifies() {
         .arg("2000")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

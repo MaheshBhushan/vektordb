@@ -68,7 +68,11 @@ pub struct DbOptions {
 
 impl Default for DbOptions {
     fn default() -> Self {
-        Self { config: HnswConfig::default(), sync: SyncPolicy::Always, enable_wal: true }
+        Self {
+            config: HnswConfig::default(),
+            sync: SyncPolicy::Always,
+            enable_wal: true,
+        }
     }
 }
 
@@ -87,7 +91,10 @@ impl Db {
             VectorStore::create(&store_path, dim)?
         };
         if store.dim() != dim {
-            return Err(Error::DimensionMismatch { expected: store.dim(), got: dim });
+            return Err(Error::DimensionMismatch {
+                expected: store.dim(),
+                got: dim,
+            });
         }
 
         let (index, replay_from) = if snap_path.exists() {
@@ -109,7 +116,10 @@ impl Db {
                 if (id as usize) == store.len() {
                     store.append(&vector)?;
                 } else if (id as usize) > store.len() {
-                    return Err(Error::Corrupt(format!("WAL skips store id {}", store.len())));
+                    return Err(Error::Corrupt(format!(
+                        "WAL skips store id {}",
+                        store.len()
+                    )));
                 }
                 if (id as usize) >= index.len() {
                     index.insert(&store, id, &mut level_rng(id));
@@ -149,7 +159,10 @@ impl Db {
                 // durability.
                 let mut wal = wal.lock();
                 let id = self.store.append(vector)?;
-                wal.append(&WalOp::Insert { id, vector: vector.to_vec() })?;
+                wal.append(&WalOp::Insert {
+                    id,
+                    vector: vector.to_vec(),
+                })?;
                 id
             }
             None => self.store.append(vector)?,
@@ -161,7 +174,9 @@ impl Db {
             if state.codes.len() < need {
                 state.codes.resize(need, 0);
             }
-            state.pq.encode(vector, &mut state.codes[id as usize * m..][..m]);
+            state
+                .pq
+                .encode(vector, &mut state.codes[id as usize * m..][..m]);
         }
         Ok(id)
     }
@@ -176,7 +191,10 @@ impl Db {
         let n = self.store.len();
         let dim = self.store.dim();
         if n < crate::pq::K {
-            return Err(Error::Corrupt(format!("need >= {} vectors to train PQ", crate::pq::K)));
+            return Err(Error::Corrupt(format!(
+                "need >= {} vectors to train PQ",
+                crate::pq::K
+            )));
         }
         let step = (n / max_samples.max(1)).max(1);
         let mut samples = Vec::with_capacity((n / step + 1) * dim);
@@ -198,9 +216,18 @@ impl Db {
     /// Approximate search over PQ codes (ADC), then re-rank the best
     /// `k * rerank` candidates with full-precision vectors from the store.
     /// `rerank = 0` skips re-ranking and returns raw ADC results.
-    pub fn search_pq(&self, query: &[f32], k: usize, ef: usize, rerank: usize) -> Result<Vec<Neighbor>> {
+    pub fn search_pq(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        rerank: usize,
+    ) -> Result<Vec<Neighbor>> {
         if query.len() != self.store.dim() {
-            return Err(Error::DimensionMismatch { expected: self.store.dim(), got: query.len() });
+            return Err(Error::DimensionMismatch {
+                expected: self.store.dim(),
+                got: query.len(),
+            });
         }
         let state = self.pq.read();
         let Some(state) = state.as_ref() else {
@@ -228,7 +255,10 @@ impl Db {
     /// Lock-free approximate search.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<Neighbor>> {
         if query.len() != self.store.dim() {
-            return Err(Error::DimensionMismatch { expected: self.store.dim(), got: query.len() });
+            return Err(Error::DimensionMismatch {
+                expected: self.store.dim(),
+                got: query.len(),
+            });
         }
         Ok(self.index.search(&self.store, query, k, ef))
     }
@@ -293,7 +323,10 @@ impl Db {
             Some(wal) => {
                 let mut wal = wal.lock();
                 let id = self.store.append(vector)?;
-                wal.append(&WalOp::Insert { id, vector: vector.to_vec() })?;
+                wal.append(&WalOp::Insert {
+                    id,
+                    vector: vector.to_vec(),
+                })?;
                 Ok(id)
             }
             None => self.store.append(vector),
@@ -410,7 +443,11 @@ mod tests {
             }
         } // crash #2: no checkpoint — those 100 inserts live only in the WAL
         let db = Db::open(dir.path(), dim, DbOptions::default()).unwrap();
-        assert_eq!(db.len(), 400, "post-checkpoint inserts lost on second recovery");
+        assert_eq!(
+            db.len(),
+            400,
+            "post-checkpoint inserts lost on second recovery"
+        );
         let hits = db.search(&vec_for(399, dim), 1, 64).unwrap();
         assert_eq!(hits[0].id, 399);
     }
@@ -419,7 +456,15 @@ mod tests {
     fn pq_search_with_rerank_recovers_exact_ranking() {
         let dir = tempfile::tempdir().unwrap();
         let dim = 32;
-        let db = Db::open(dir.path(), dim, DbOptions { sync: crate::wal::SyncPolicy::Never, ..Default::default() }).unwrap();
+        let db = Db::open(
+            dir.path(),
+            dim,
+            DbOptions {
+                sync: crate::wal::SyncPolicy::Never,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // Clustered data so PQ codebooks have structure to capture.
         let mut rng = rand::rngs::SmallRng::seed_from_u64(6);
         use rand::Rng;
@@ -446,12 +491,11 @@ mod tests {
         let queries = 50;
         for _ in 0..queries {
             let q = sample(&mut rng);
-            let truth: std::collections::HashSet<u64> = crate::storage::exact_search(
-                &db.store, &q, 10, Metric::L2,
-            )
-            .into_iter()
-            .map(|n| n.id)
-            .collect();
+            let truth: std::collections::HashSet<u64> =
+                crate::storage::exact_search(&db.store, &q, 10, Metric::L2)
+                    .into_iter()
+                    .map(|n| n.id)
+                    .collect();
             let reranked = db.search_pq(&q, 10, 128, 4).unwrap();
             let raw = db.search_pq(&q, 10, 128, 0).unwrap();
             hits_pq += reranked.iter().filter(|n| truth.contains(&n.id)).count();
@@ -472,7 +516,10 @@ mod tests {
         let db = Db::open(
             dir.path(),
             dim,
-            DbOptions { enable_wal: false, ..Default::default() },
+            DbOptions {
+                enable_wal: false,
+                ..Default::default()
+            },
         )
         .unwrap();
         let n = 5000;

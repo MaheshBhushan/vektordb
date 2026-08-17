@@ -72,11 +72,7 @@ mod tests {
 
     fn vec_pair(max_len: usize) -> impl Strategy<Value = (Vec<f32>, Vec<f32>)> {
         (1..=max_len).prop_flat_map(|len| {
-            let elem = prop_oneof![
-                (-1000.0f32..1000.0),
-                (-1.0f32..1.0),
-                Just(0.0f32),
-            ];
+            let elem = prop_oneof![(-1000.0f32..1000.0), (-1.0f32..1.0), Just(0.0f32),];
             (
                 prop::collection::vec(elem.clone(), len),
                 prop::collection::vec(elem, len),
@@ -130,7 +126,10 @@ mod tests {
         assert_eq!(Metric::L2.kernel()(&a, &b), 128.0);
         assert_eq!(Metric::Dot.kernel()(&a, &b), -256.0);
         let c = Metric::Cosine.kernel()(&a, &b);
-        assert!(c.abs() < 1e-6, "parallel vectors should have cosine distance 0, got {c}");
+        assert!(
+            c.abs() < 1e-6,
+            "parallel vectors should have cosine distance 0, got {c}"
+        );
     }
 
     #[test]

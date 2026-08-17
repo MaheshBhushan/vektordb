@@ -56,7 +56,11 @@ pub struct HnswConfig {
 
 impl Default for HnswConfig {
     fn default() -> Self {
-        Self { m: 16, ef_construction: 200, metric: Metric::L2 }
+        Self {
+            m: 16,
+            ef_construction: 200,
+            metric: Metric::L2,
+        }
     }
 }
 
@@ -193,9 +197,15 @@ impl Hnsw {
 
         let entry_dist = dist(entry);
         let mut candidates = BinaryHeap::new(); // min-heap via Reverse
-        candidates.push(std::cmp::Reverse(Neighbor { id: entry, distance: entry_dist }));
+        candidates.push(std::cmp::Reverse(Neighbor {
+            id: entry,
+            distance: entry_dist,
+        }));
         let mut results: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(ef + 1);
-        results.push(Neighbor { id: entry, distance: entry_dist });
+        results.push(Neighbor {
+            id: entry,
+            distance: entry_dist,
+        });
 
         while let Some(std::cmp::Reverse(current)) = candidates.pop() {
             // Paper line 8: stop once the closest open candidate is farther
@@ -211,8 +221,18 @@ impl Hnsw {
                 let d = dist(next);
                 let worst = results.peek().map(|n| n.distance).unwrap_or(f32::INFINITY);
                 if results.len() < ef || d < worst {
-                    candidates.push(std::cmp::Reverse(Neighbor { id: next, distance: d }));
-                    push_bounded(&mut results, Neighbor { id: next, distance: d }, ef);
+                    candidates.push(std::cmp::Reverse(Neighbor {
+                        id: next,
+                        distance: d,
+                    }));
+                    push_bounded(
+                        &mut results,
+                        Neighbor {
+                            id: next,
+                            distance: d,
+                        },
+                        ef,
+                    );
                 }
             });
         }
@@ -250,12 +270,7 @@ impl Hnsw {
     /// A candidate is kept only if it is closer to the base than to every
     /// already-selected neighbor — this spreads links directionally, which
     /// the paper shows is what preserves recall on clustered data.
-    fn select_neighbors(
-        &self,
-        store: &VectorStore,
-        candidates: &[Neighbor],
-        m: usize,
-    ) -> Vec<u64> {
+    fn select_neighbors(&self, store: &VectorStore, candidates: &[Neighbor], m: usize) -> Vec<u64> {
         let mut selected: Vec<Neighbor> = Vec::with_capacity(m);
         let mut pruned: Vec<Neighbor> = Vec::new();
 
@@ -294,7 +309,11 @@ impl Hnsw {
         let node = self.node(id);
         let _w = node.lock.lock();
         let cur = node.links[layer].load(Ordering::Acquire, guard);
-        let snapshot: &[u64] = if cur.is_null() { &[] } else { unsafe { cur.deref() } };
+        let snapshot: &[u64] = if cur.is_null() {
+            &[]
+        } else {
+            unsafe { cur.deref() }
+        };
         let next = mutate(snapshot);
         node.links[layer].store(Owned::new(next), Ordering::Release);
         if !cur.is_null() {
@@ -377,9 +396,7 @@ impl Hnsw {
                             .iter()
                             .map(|&x| Neighbor {
                                 id: x,
-                                distance: (self.kernel)(base, unsafe {
-                                    store.get_unchecked(x)
-                                }),
+                                distance: (self.kernel)(base, unsafe { store.get_unchecked(x) }),
                             })
                             .collect();
                         cands.sort();
@@ -400,13 +417,7 @@ impl Hnsw {
     }
 
     /// Alg. 5 K-NN-SEARCH. Lock-free; safe to call concurrently with inserts.
-    pub fn search(
-        &self,
-        store: &VectorStore,
-        query: &[f32],
-        k: usize,
-        ef: usize,
-    ) -> Vec<Neighbor> {
+    pub fn search(&self, store: &VectorStore, query: &[f32], k: usize, ef: usize) -> Vec<Neighbor> {
         self.search_with_oracle(|id| self.distance(store, query, id), k, ef)
     }
 
@@ -431,9 +442,8 @@ impl Hnsw {
         for layer in (1..=top).rev() {
             (ep, ep_dist) = self.greedy_descend(&guard, &dist, ep, ep_dist, layer);
         }
-        let results = VISITED.with(|v| {
-            self.search_layer(&guard, &dist, &mut v.borrow_mut(), ep, ef, 0)
-        });
+        let results =
+            VISITED.with(|v| self.search_layer(&guard, &dist, &mut v.borrow_mut(), ep, ef, 0));
         let mut out = results.into_sorted_vec();
         out.truncate(k);
         out
@@ -467,7 +477,9 @@ impl Hnsw {
             self.with_links(&guard, i, 0, |nb| indeg[nb as usize] += 1);
         }
         let (entry, _) = unpack_entry(self.entry.load(Ordering::Acquire));
-        (0..n as u64).filter(|&i| indeg[i as usize] == 0 && i != entry).count()
+        (0..n as u64)
+            .filter(|&i| indeg[i as usize] == 0 && i != entry)
+            .count()
     }
 
     /// Structural invariants, checked by tests after building.
@@ -523,7 +535,13 @@ mod tests {
         dim: usize,
         config: HnswConfig,
         seed: u64,
-    ) -> (VectorStore, Hnsw, rand::rngs::StdRng, Vec<Vec<f32>>, tempfile::TempDir) {
+    ) -> (
+        VectorStore,
+        Hnsw,
+        rand::rngs::StdRng,
+        Vec<Vec<f32>>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), dim).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -569,8 +587,16 @@ mod tests {
 
     #[test]
     fn recall_on_50k_clustered() {
-        let (store, index, mut rng, centers, _dir) =
-            build_random(50_000, 32, HnswConfig { m: 16, ef_construction: 200, metric: Metric::L2 }, 42);
+        let (store, index, mut rng, centers, _dir) = build_random(
+            50_000,
+            32,
+            HnswConfig {
+                m: 16,
+                ef_construction: 200,
+                metric: Metric::L2,
+            },
+            42,
+        );
         index.check_invariants();
         let recall = recall_at_k(&store, &index, &centers, &mut rng, 100, 10, 128);
         assert!(recall >= 0.95, "recall@10 = {recall}, expected >= 0.95");
@@ -599,7 +625,11 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(12321);
         // Small M makes in-link starvation more likely — same regime the
         // crash harness runs (M defaults to 16, but pruning still bites).
-        let index = Hnsw::new(HnswConfig { m: 16, ef_construction: 200, metric: Metric::L2 });
+        let index = Hnsw::new(HnswConfig {
+            m: 16,
+            ef_construction: 200,
+            metric: Metric::L2,
+        });
         let centers = make_centers(dim, &mut rng);
         for _ in 0..12_000 {
             let v = sample_blob(&centers, &mut rng);
@@ -611,14 +641,21 @@ mod tests {
         // it cannot return it as top-1. Confirm the two notions agree.
         for &id in orphans.iter().take(5) {
             let hits = index.search(&store, unsafe { store.get_unchecked(id) }, 1, 8192);
-            assert_ne!(hits.first().map(|h| h.id), Some(id),
-                "node {id} has zero in-links yet was found — contradiction");
+            assert_ne!(
+                hits.first().map(|h| h.id),
+                Some(id),
+                "node {id} has zero in-links yet was found — contradiction"
+            );
         }
         // This is a documented HNSW property; we only assert it stays rare.
         let frac = orphans.len() as f64 / index.len() as f64;
         assert!(frac < 0.01, "unreachable fraction {frac} unexpectedly high");
-        eprintln!("clean build: {} / {} nodes unreachable ({:.4}%)",
-            orphans.len(), index.len(), frac * 100.0);
+        eprintln!(
+            "clean build: {} / {} nodes unreachable ({:.4}%)",
+            orphans.len(),
+            index.len(),
+            frac * 100.0
+        );
     }
 
     #[test]
@@ -675,7 +712,11 @@ mod tests {
         let n_writers = 4;
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), dim).unwrap();
-        let index = Hnsw::new(HnswConfig { m: 12, ef_construction: 100, metric: Metric::L2 });
+        let index = Hnsw::new(HnswConfig {
+            m: 12,
+            ef_construction: 100,
+            metric: Metric::L2,
+        });
         let mut seed_rng = rand::rngs::StdRng::seed_from_u64(77);
         let centers = make_centers(dim, &mut seed_rng);
 

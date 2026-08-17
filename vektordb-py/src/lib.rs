@@ -12,8 +12,8 @@ use pyo3::prelude::*;
 
 use vektordb_core::distance::Metric;
 use vektordb_core::hnsw::HnswConfig;
-use vektordb_core::{Db, DbOptions};
 use vektordb_core::wal::SyncPolicy;
+use vektordb_core::{Db, DbOptions};
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -53,7 +53,11 @@ impl VektorDb {
             other => return Err(PyValueError::new_err(format!("unknown metric {other:?}"))),
         };
         let opts = DbOptions {
-            config: HnswConfig { m, ef_construction, metric },
+            config: HnswConfig {
+                m,
+                ef_construction,
+                metric,
+            },
             sync: SyncPolicy::Always,
             enable_wal: durable,
         };
@@ -134,24 +138,26 @@ impl VektorDb {
         let flat = queries.as_slice()?.to_vec();
         let dim = self.dim;
 
-        let (ids, dists) = py.allow_threads(|| {
-            use rayon::prelude::*;
-            let mut ids = vec![u64::MAX; nq * k];
-            let mut dists = vec![f32::INFINITY; nq * k];
-            ids.par_chunks_mut(k)
-                .zip(dists.par_chunks_mut(k))
-                .enumerate()
-                .try_for_each(|(q, (id_row, dist_row))| {
-                    let query = &flat[q * dim..][..dim];
-                    let hits = self.db.search_pq(query, k, ef, rerank)?;
-                    for (j, h) in hits.iter().enumerate() {
-                        id_row[j] = h.id;
-                        dist_row[j] = h.distance;
-                    }
-                    Ok::<_, vektordb_core::Error>(())
-                })
-                .map(|_| (ids, dists))
-        }).map_err(err)?;
+        let (ids, dists) = py
+            .allow_threads(|| {
+                use rayon::prelude::*;
+                let mut ids = vec![u64::MAX; nq * k];
+                let mut dists = vec![f32::INFINITY; nq * k];
+                ids.par_chunks_mut(k)
+                    .zip(dists.par_chunks_mut(k))
+                    .enumerate()
+                    .try_for_each(|(q, (id_row, dist_row))| {
+                        let query = &flat[q * dim..][..dim];
+                        let hits = self.db.search_pq(query, k, ef, rerank)?;
+                        for (j, h) in hits.iter().enumerate() {
+                            id_row[j] = h.id;
+                            dist_row[j] = h.distance;
+                        }
+                        Ok::<_, vektordb_core::Error>(())
+                    })
+                    .map(|_| (ids, dists))
+            })
+            .map_err(err)?;
 
         Ok((rows_u64(py, ids, nq, k)?, rows_f32(py, dists, nq, k)?))
     }
@@ -159,7 +165,8 @@ impl VektorDb {
     /// Train product quantization on the current contents.
     #[pyo3(signature = (m=16, iters=25, max_samples=100_000))]
     fn train_pq(&self, py: Python<'_>, m: usize, iters: usize, max_samples: usize) -> PyResult<()> {
-        py.allow_threads(|| self.db.train_pq(m, iters, max_samples)).map_err(err)
+        py.allow_threads(|| self.db.train_pq(m, iters, max_samples))
+            .map_err(err)
     }
 
     /// Persist a snapshot and flush the store.
@@ -190,12 +197,26 @@ impl VektorDb {
 
 /// Wrap a flat `n*k` buffer as an (n, k) numpy array (one copy in, then a
 /// zero-copy reshape).
-fn rows_u64(py: Python<'_>, flat: Vec<u64>, n: usize, k: usize) -> PyResult<Bound<'_, PyArray2<u64>>> {
-    PyArray1::from_slice_bound(py, &flat).reshape([n, k]).map_err(Into::into)
+fn rows_u64(
+    py: Python<'_>,
+    flat: Vec<u64>,
+    n: usize,
+    k: usize,
+) -> PyResult<Bound<'_, PyArray2<u64>>> {
+    PyArray1::from_slice_bound(py, &flat)
+        .reshape([n, k])
+        .map_err(Into::into)
 }
 
-fn rows_f32(py: Python<'_>, flat: Vec<f32>, n: usize, k: usize) -> PyResult<Bound<'_, PyArray2<f32>>> {
-    PyArray1::from_slice_bound(py, &flat).reshape([n, k]).map_err(Into::into)
+fn rows_f32(
+    py: Python<'_>,
+    flat: Vec<f32>,
+    n: usize,
+    k: usize,
+) -> PyResult<Bound<'_, PyArray2<f32>>> {
+    PyArray1::from_slice_bound(py, &flat)
+        .reshape([n, k])
+        .map_err(Into::into)
 }
 
 #[pymodule]

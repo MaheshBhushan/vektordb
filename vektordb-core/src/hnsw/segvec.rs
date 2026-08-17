@@ -114,7 +114,10 @@ impl<T> Drop for SegVec<T> {
                 for i in 0..init {
                     (*(*p.add(i)).get()).assume_init_drop();
                 }
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, seg_len(seg))));
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    p,
+                    seg_len(seg),
+                )));
             }
         }
     }
