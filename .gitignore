@@ -1,7 +1,5 @@
 /target
 bench/data/
-bench/results/*.csv
-bench/results/*.png
 __pycache__/
 *.egg-info/
 .venv/

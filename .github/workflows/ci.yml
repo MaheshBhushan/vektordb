@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Report CPU features
+        run: grep -o 'avx2\|fma' /proc/cpuinfo | sort -u
+        # The AVX2 kernels are runtime-dispatched; this records whether the
+        # runner actually exercised them or fell back to scalar.
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      # Unit, property (proptest), concurrency stress, and the crash-recovery
+      # harness in vektordb-cli/tests/crash.rs, which SIGKILLs a live ingest at
+      # randomized points and asserts every acked insert survives reopen.
+      - name: Test
+        run: cargo test --workspace --release
