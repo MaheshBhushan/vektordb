@@ -352,4 +352,54 @@ mod tests {
             assert_eq!(a, b);
         }
     }
+
+    #[test]
+    fn from_bytes_rejects_malformed_input_without_panicking() {
+        // This returns Option to signal "this data is corrupt", so every
+        // rejection path must return None -- not panic. It used to index
+        // data[0..3] before checking the length, so the two shortest corrupt
+        // inputs possible (empty, and a partial header) both panicked.
+        let dim = 16;
+        let data = blobs(1000, dim, 8);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let good = ProductQuantizer::train(&data, dim, 4, 5, &mut rng).to_bytes();
+
+        let hdr = |dim: u32, m: u32, sub_dim: u32| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&dim.to_le_bytes());
+            v.extend_from_slice(&m.to_le_bytes());
+            v.extend_from_slice(&sub_dim.to_le_bytes());
+            v
+        };
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0]),
+            ("partial header", good[..11].to_vec()),
+            ("header only, no centroids", good[..12].to_vec()),
+            ("body one byte short", good[..good.len() - 1].to_vec()),
+            ("body not a multiple of 4", {
+                let mut v = good.clone();
+                v.push(0);
+                v
+            }),
+            ("dim zero", hdr(0, 4, 4)),
+            ("m zero", hdr(16, 0, 4)),
+            ("sub_dim zero", hdr(16, 4, 0)),
+            ("sub_dim * m != dim", hdr(16, 4, 5)),
+            (
+                "multiplication overflows usize",
+                hdr(u32::MAX, u32::MAX, u32::MAX),
+            ),
+        ];
+        for (name, bytes) in cases {
+            assert!(
+                ProductQuantizer::from_bytes(&bytes).is_none(),
+                "{name}: expected None"
+            );
+        }
+
+        // ...and the valid input still round-trips.
+        assert!(ProductQuantizer::from_bytes(&good).is_some());
+    }
 }
