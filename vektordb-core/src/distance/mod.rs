@@ -13,10 +13,13 @@ pub type DistanceFn = fn(&[f32], &[f32]) -> f32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
+    /// Squared L2. Monotonic in true L2, so it ranks identically without the
+    /// square root.
     L2,
     /// Inner-product "distance": negated dot, so smaller is better for all
     /// metrics uniformly.
     Dot,
+    /// Cosine *distance*: `1 - cos(a, b)`, so smaller is better here too.
     Cosine,
 }
 
