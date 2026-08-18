@@ -136,7 +136,9 @@ pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// Cosine similarity of `a` and `b`, computed in one pass.
+/// Cosine *distance*: `1 - cos(a, b)`, computed in one pass (the three sums
+/// accumulate together, so the vectors are read once). Zero-norm inputs yield
+/// distance 1. Matches [`scalar::cosine`](crate::distance::scalar::cosine).
 ///
 /// # Safety
 ///
