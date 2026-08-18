@@ -20,10 +20,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The AVX2 kernels are runtime-dispatched; this records whether the
+      # runner actually exercised them or fell back to scalar. grep exits 1
+      # when it matches nothing, which would fail the job on a runner without
+      # AVX2 (or any non-x86 runner) -- so this must not gate the build.
       - name: Report CPU features
-        run: grep -o 'avx2\|fma' /proc/cpuinfo | sort -u
-        # The AVX2 kernels are runtime-dispatched; this records whether the
-        # runner actually exercised them or fell back to scalar.
+        run: |
+          grep -o 'avx2\|fma' /proc/cpuinfo | sort -u \
+            || echo 'no avx2/fma -- scalar fallback path'
 
       - name: Build
         run: cargo build --workspace --release
