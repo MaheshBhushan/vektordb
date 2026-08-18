@@ -119,22 +119,37 @@ impl ProductQuantizer {
         table
     }
 
-    /// Serialize to bytes (checkpoint payload).
-    pub fn to_bytes(&self) -> Vec<f32> {
-        let mut out = Vec::with_capacity(3 + self.centroids.len());
-        out.push(self.dim as f32);
-        out.push(self.m as f32);
-        out.push(self.sub_dim as f32);
-        out.extend_from_slice(&self.centroids);
+    /// Serialize the codebook: `[dim u32][m u32][sub_dim u32][centroids f32...]`,
+    /// little-endian. See `Db::checkpoint` for the framing (magic + crc) that
+    /// wraps this on disk.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.centroids.len() * 4);
+        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        out.extend_from_slice(&(self.m as u32).to_le_bytes());
+        out.extend_from_slice(&(self.sub_dim as u32).to_le_bytes());
+        for c in &self.centroids {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
         out
     }
 
-    pub fn from_bytes(data: &[f32]) -> Option<Self> {
-        let (dim, m, sub_dim) = (data[0] as usize, data[1] as usize, data[2] as usize);
-        let centroids = data[3..].to_vec();
-        if dim == 0 || m == 0 || sub_dim * m != dim || centroids.len() != m * K * sub_dim {
+    /// Inverse of [`to_bytes`](Self::to_bytes). `None` on any malformed input,
+    /// including one too short to hold the header.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        let head = data.get(..12)?;
+        let u32_at = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap()) as usize;
+        let (dim, m, sub_dim) = (u32_at(0), u32_at(4), u32_at(8));
+        let body = &data[12..];
+        if dim == 0 || m == 0 || sub_dim == 0 || sub_dim.checked_mul(m)? != dim {
             return None;
         }
+        if body.len() != m.checked_mul(K)?.checked_mul(sub_dim)?.checked_mul(4)? {
+            return None;
+        }
+        let centroids = body
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         Some(Self {
             dim,
             m,
@@ -326,6 +341,8 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         let pq = ProductQuantizer::train(&data, dim, 4, 5, &mut rng);
         let restored = ProductQuantizer::from_bytes(&pq.to_bytes()).unwrap();
+        assert_eq!(restored.m(), pq.m());
+        assert_eq!(restored.dim(), pq.dim());
         let mut a = vec![0u8; 4];
         let mut b = vec![0u8; 4];
         for i in 0..20 {

@@ -3,6 +3,7 @@
 //!   dir/
 //!     vectors.store   mmap vector segments (M2)
 //!     index.snap      HNSW checkpoint (atomic rename)
+//!     pq.codebook     PQ centroids, if trained (atomic rename)
 //!     wal             insert log since the last checkpoint
 //!
 //! Write path: WAL append + fdatasync (the ack point), then graph insert.
@@ -56,6 +57,7 @@ pub struct Db {
     maintenance: RwLock<()>,
     pq: RwLock<Option<PqState>>,
     snap_path: PathBuf,
+    pq_path: PathBuf,
 }
 
 pub struct DbOptions {
@@ -83,6 +85,7 @@ impl Db {
         std::fs::create_dir_all(dir)?;
         let store_path = dir.join("vectors.store");
         let snap_path = dir.join("index.snap");
+        let pq_path = dir.join("pq.codebook");
         let wal_path = dir.join("wal");
 
         let store = if store_path.exists() {
@@ -138,13 +141,33 @@ impl Db {
             }
         }
 
+        // After replay, so the codes we derive cover every recovered vector.
+        let pq = if pq_path.exists() {
+            let quantizer = load_codebook(&pq_path)?;
+            if quantizer.dim() != store.dim() {
+                return Err(Error::Corrupt(format!(
+                    "pq.codebook is for dim {}, store has {}",
+                    quantizer.dim(),
+                    store.dim()
+                )));
+            }
+            let codes = encode_all(&quantizer, &store);
+            Some(PqState {
+                pq: quantizer,
+                codes,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             store,
             index,
             wal,
             maintenance: RwLock::new(()),
-            pq: RwLock::new(None),
+            pq: RwLock::new(pq),
             snap_path,
+            pq_path,
         })
     }
 
@@ -204,11 +227,7 @@ impl Db {
         let mut rng = SmallRng::from_entropy();
         let pq = ProductQuantizer::train(&samples, dim, m, iters, &mut rng);
 
-        let mut codes = vec![0u8; n * m];
-        use rayon::prelude::*;
-        codes.par_chunks_mut(m).enumerate().for_each(|(id, out)| {
-            pq.encode(unsafe { self.store.get_unchecked(id as u64) }, out);
-        });
+        let codes = encode_all(&pq, &self.store);
         *self.pq.write() = Some(PqState { pq, codes });
         Ok(())
     }
@@ -269,6 +288,9 @@ impl Db {
     pub fn checkpoint(&self) -> Result<()> {
         let _exclusive = self.maintenance.write();
         self.store.flush()?;
+        if let Some(state) = self.pq.read().as_ref() {
+            save_codebook(&self.pq_path, &state.pq)?;
+        }
         match &self.wal {
             Some(wal) => {
                 let mut wal = wal.lock();
@@ -361,6 +383,77 @@ impl Db {
     }
 }
 
+// --- PQ codebook persistence -------------------------------------------------
+//
+// Only the *codebook* is stored, never the per-vector codes: codes are a pure
+// function of (codebook, store), so re-deriving them on open means they can
+// never drift out of sync with the vectors -- including vectors recovered from
+// the WAL after the last checkpoint. The codebook is tiny (m*256*sub_dim
+// floats, 128 KiB at m=16/dim=128); re-encoding is the cost, and it is
+// rayon-parallel.
+
+const PQ_MAGIC: u32 = 0x564B_5051; // "VKPQ"
+const PQ_VERSION: u32 = 1;
+
+/// Encode every vector in `store` under `pq`.
+fn encode_all(pq: &ProductQuantizer, store: &VectorStore) -> Vec<u8> {
+    use rayon::prelude::*;
+    let (n, m) = (store.len(), pq.m());
+    let mut codes = vec![0u8; n * m];
+    codes.par_chunks_mut(m).enumerate().for_each(|(id, out)| {
+        pq.encode(unsafe { store.get_unchecked(id as u64) }, out);
+    });
+    codes
+}
+
+/// Write the codebook via temp file + fsync + rename, like the HNSW snapshot,
+/// so a crash mid-checkpoint leaves the previous codebook intact.
+fn save_codebook(path: &Path, pq: &ProductQuantizer) -> Result<()> {
+    use std::io::Write;
+
+    let body = pq.to_bytes();
+    let mut buf = Vec::with_capacity(body.len() + 12);
+    buf.extend_from_slice(&PQ_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&PQ_VERSION.to_le_bytes());
+    buf.extend_from_slice(&body);
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn load_codebook(path: &Path) -> Result<ProductQuantizer> {
+    let raw = std::fs::read(path)?;
+    if raw.len() < 16 {
+        return Err(Error::Corrupt("pq.codebook truncated".into()));
+    }
+    let (payload, crc_bytes) = raw.split_at(raw.len() - 4);
+    let want = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    if crc32fast::hash(payload) != want {
+        return Err(Error::Corrupt("pq.codebook checksum mismatch".into()));
+    }
+    if u32::from_le_bytes(payload[0..4].try_into().unwrap()) != PQ_MAGIC {
+        return Err(Error::Corrupt("pq.codebook bad magic".into()));
+    }
+    let version = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+    if version != PQ_VERSION {
+        return Err(Error::Corrupt(format!(
+            "pq.codebook version {version}, expected {PQ_VERSION}"
+        )));
+    }
+    ProductQuantizer::from_bytes(&payload[8..])
+        .ok_or_else(|| Error::Corrupt("pq.codebook malformed".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +469,71 @@ mod tests {
                 ((x >> 33) as u32) as f32 / u32::MAX as f32 - 0.5
             })
             .collect()
+    }
+
+    #[test]
+    fn pq_survives_checkpoint_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 32;
+        let n = 600;
+        let data: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+            .collect();
+
+        let before = {
+            let db = Db::open(dir.path(), dim, DbOptions::default()).unwrap();
+            db.add_batch(&data).unwrap();
+            db.train_pq(8, 10, 100_000).unwrap();
+            let q = &data[13 * dim..][..dim];
+            let hits = db.search_pq(q, 10, 64, 4).unwrap();
+            db.checkpoint().unwrap();
+            hits
+        };
+
+        // Reopen: search_pq used to fail here with "PQ not trained", because
+        // the codebook was only ever held in memory.
+        let db = Db::open(dir.path(), dim, DbOptions::default()).unwrap();
+        let q = &data[13 * dim..][..dim];
+        let after = db
+            .search_pq(q, 10, 64, 4)
+            .expect("PQ must be restored from pq.codebook on open");
+        let ids = |v: &[crate::storage::Neighbor]| v.iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&before),
+            ids(&after),
+            "same codebook must rank the same"
+        );
+
+        // Codes are re-derived from the store, so vectors inserted after the
+        // checkpoint are covered too.
+        db.insert(&vec![0.42f32; dim]).unwrap();
+        db.search_pq(q, 10, 64, 4).unwrap();
+    }
+
+    #[test]
+    fn corrupt_codebook_is_rejected_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 32;
+        let data: Vec<f32> = (0..600 * dim).map(|i| (i % 251) as f32 / 251.0).collect();
+        {
+            let db = Db::open(dir.path(), dim, DbOptions::default()).unwrap();
+            db.add_batch(&data).unwrap();
+            db.train_pq(8, 5, 100_000).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let path = dir.path().join("pq.codebook");
+        let mut raw = std::fs::read(&path).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0xFF;
+        std::fs::write(&path, &raw).unwrap();
+
+        match Db::open(dir.path(), dim, DbOptions::default()) {
+            Err(e) => assert!(
+                e.to_string().contains("checksum mismatch"),
+                "unhelpful error: {e}"
+            ),
+            Ok(_) => panic!("a corrupt codebook must not open silently"),
+        }
     }
 
     #[test]
