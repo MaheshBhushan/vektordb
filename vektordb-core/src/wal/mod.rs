@@ -3,11 +3,23 @@
 //! Record framing:
 //!   [len: u32][crc32: u32][payload: len bytes]
 //!   payload = [lsn: u64][op: u8][op body]
-//! CRC covers the payload. Recovery walks records until EOF, a short read,
-//! or a CRC mismatch; everything from the first bad record on is a torn
-//! tail from a crash mid-write and is truncated — that is the expected
-//! contract, not an error: a record is acked only after fdatasync, so a
-//! torn record was never acked.
+//! CRC covers the payload. Recovery walks records until EOF and then has to
+//! decide, for anything that isn't a clean record, whether it is *torn* or
+//! *corrupt* — because the two have opposite correct responses:
+//!
+//! - **Torn**: the bad frame is the last thing in the file. A crash mid-write
+//!   can leave a partial header, a partial payload, or (if the page cache
+//!   persisted sectors out of order) a full-length frame with garbage inside.
+//!   None of it was ever acked, because an ack happens only after fdatasync.
+//!   Truncating is correct and lossless.
+//! - **Corrupt**: the bad frame has intact-looking data *after* it, so it was
+//!   fully written and fsynced — it was acked — and something later damaged
+//!   it. Truncating here would silently destroy every acked record that
+//!   follows, permanently. So this is an error, and recovery refuses to open.
+//!
+//! Earlier versions treated both cases as a torn tail, which meant one
+//! flipped bit mid-log silently dropped every record after it and then wrote
+//! the truncation to disk.
 //!
 //! Ops: only `Insert` in v1 (HNSW deletion is future work), plus the
 //! checkpoint watermark living in the snapshot file, not the log.
@@ -16,7 +28,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 const OP_INSERT: u8 = 1;
 
@@ -57,10 +69,27 @@ impl Wal {
         {
             let len = file.metadata()?.len();
             let mut reader = BufReader::new(&mut file);
-            while let Some((consumed, lsn, op)) = read_record(&mut reader, len, good_end) {
-                good_end += consumed;
-                next_lsn = next_lsn.max(lsn + 1);
-                records.push((lsn, op));
+            loop {
+                match read_record(&mut reader, len, good_end) {
+                    Step::Record { consumed, lsn, op } => {
+                        good_end += consumed;
+                        next_lsn = next_lsn.max(lsn + 1);
+                        records.push((lsn, op));
+                    }
+                    Step::Stopped(Stop::Eof) | Step::Stopped(Stop::Torn) => break,
+                    Step::Stopped(Stop::Corrupt(why)) => {
+                        // Refusing to open is the whole point: the records
+                        // after this one were acked, and truncating to
+                        // `good_end` would destroy them irrecoverably.
+                        return Err(Error::Corrupt(format!(
+                            "wal: {why} at byte offset {good_end}, with {} intact \
+                             record(s) before it and more data after it; this is \
+                             damage to already-acked records, not a torn tail from \
+                             a crash. Refusing to truncate.",
+                            records.len()
+                        )));
+                    }
+                }
             }
         }
         if file.metadata()?.len() > good_end {
@@ -137,33 +166,82 @@ impl Wal {
     }
 }
 
-/// Try to read one record at `pos`; `None` on EOF / torn tail.
-fn read_record<R: Read>(reader: &mut R, file_len: u64, pos: u64) -> Option<(u64, u64, WalOp)> {
+/// Why the recovery walk stopped at `pos`.
+enum Stop {
+    /// Clean end of the log.
+    Eof,
+    /// Incomplete or damaged frame that is the *last* thing in the file:
+    /// a crash mid-write. Safe to truncate — it was never acked.
+    Torn,
+    /// Damaged frame with more data after it: it was acked, then rotted.
+    /// Truncating would destroy acked records, so this fails recovery.
+    Corrupt(&'static str),
+}
+
+enum Step {
+    Record { consumed: u64, lsn: u64, op: WalOp },
+    Stopped(Stop),
+}
+
+/// Read one record starting at `pos`, or explain why we can't.
+fn read_record<R: Read>(reader: &mut R, file_len: u64, pos: u64) -> Step {
+    use Step::{Record, Stopped};
+
+    if pos == file_len {
+        return Stopped(Stop::Eof);
+    }
     if pos + 8 > file_len {
-        return None;
+        return Stopped(Stop::Torn); // partial header
     }
     let mut head = [0u8; 8];
-    reader.read_exact(&mut head).ok()?;
+    if reader.read_exact(&mut head).is_err() {
+        return Stopped(Stop::Torn);
+    }
     let len = u32::from_le_bytes(head[0..4].try_into().unwrap()) as u64;
     let crc = u32::from_le_bytes(head[4..8].try_into().unwrap());
-    if len < 9 || pos + 8 + len > file_len {
-        return None; // impossible length: torn or garbage
+
+    // A length that can't be real means the header itself is damaged. We
+    // can't trust it to tell us where this frame ends, so we can only ask
+    // whether anything follows the header at all.
+    if len < 9 {
+        return Stopped(if pos + 8 == file_len {
+            Stop::Torn
+        } else {
+            Stop::Corrupt("impossible record length")
+        });
     }
+    if pos + 8 + len > file_len {
+        return Stopped(Stop::Torn); // payload truncated by the crash
+    }
+
+    // The frame is wholly inside the file. From here on, "is this the last
+    // frame?" is what separates a torn tail from real corruption.
+    let is_tail = pos + 8 + len == file_len;
+    let damaged = |why: &'static str| {
+        Stopped(if is_tail {
+            Stop::Torn
+        } else {
+            Stop::Corrupt(why)
+        })
+    };
+
     let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload).ok()?;
+    if reader.read_exact(&mut payload).is_err() {
+        return Stopped(Stop::Torn);
+    }
     if crc32fast::hash(&payload) != crc {
-        return None;
+        return damaged("checksum mismatch");
     }
     let lsn = u64::from_le_bytes(payload[0..8].try_into().unwrap());
     let op = match payload[8] {
         OP_INSERT => {
             if payload.len() < 21 {
-                return None;
+                return damaged("insert record too short");
             }
             let id = u64::from_le_bytes(payload[9..17].try_into().unwrap());
             let dim = u32::from_le_bytes(payload[17..21].try_into().unwrap()) as usize;
             if payload.len() != 21 + dim * 4 {
-                return None;
+                return damaged("insert record length disagrees with its dim");
             }
             let vector = payload[21..]
                 .chunks_exact(4)
@@ -171,9 +249,13 @@ fn read_record<R: Read>(reader: &mut R, file_len: u64, pos: u64) -> Option<(u64,
                 .collect();
             WalOp::Insert { id, vector }
         }
-        _ => return None,
+        _ => return damaged("unknown op tag"),
     };
-    Some((8 + len, lsn, op))
+    Record {
+        consumed: 8 + len,
+        lsn,
+        op,
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_middle_stops_replay_there() {
+    fn corrupted_middle_is_an_error_not_silent_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
@@ -245,14 +327,58 @@ mod tests {
             }
             wal.sync().unwrap();
         }
-        // Flip a byte in record 5's payload.
-        let mut bytes = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // Flip a byte in record 5's payload. Records 6-9 sit after it, fully
+        // written and fsynced, so they were acked.
+        let mut bytes = before.clone();
         let rec_size = bytes.len() / 10;
         bytes[5 * rec_size + 12] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
-        let (_, recs) = Wal::open(&path, SyncPolicy::Always).unwrap();
-        assert_eq!(recs.len(), 5, "replay must stop at the corrupt record");
+        let msg = match Wal::open(&path, SyncPolicy::Always) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("mid-log corruption must not be reported as success"),
+        };
+        assert!(msg.contains("checksum mismatch"), "unhelpful error: {msg}");
+        assert!(
+            msg.contains("Refusing to truncate"),
+            "unhelpful error: {msg}"
+        );
+
+        // And the failed open must not have modified the file: the acked
+        // records after the damage are still there to be recovered by hand.
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            bytes.len(),
+            "a failed recovery must not truncate anything"
+        );
+    }
+
+    #[test]
+    fn corrupt_last_record_is_treated_as_a_torn_tail() {
+        // A crash can leave the final frame full-length but with garbage in
+        // it (sectors persisted out of order). Nothing follows it, so it was
+        // never acked and truncating is correct -- this is the case that must
+        // NOT become an error, or every real crash would refuse to reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        {
+            let (mut wal, _) = Wal::open(&path, SyncPolicy::Never).unwrap();
+            for i in 0..10 {
+                wal.append(&op(i)).unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let rec_size = bytes.len() / 10;
+        let last = 9 * rec_size;
+        bytes[last + 12] ^= 0xFF; // corrupt the tail frame's payload
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (mut wal, recs) = Wal::open(&path, SyncPolicy::Always).unwrap();
+        assert_eq!(recs.len(), 9, "torn tail dropped, earlier records kept");
+        assert_eq!(wal.next_lsn(), 9);
+        wal.append(&op(99)).unwrap(); // and the log still works
     }
 
     #[test]
