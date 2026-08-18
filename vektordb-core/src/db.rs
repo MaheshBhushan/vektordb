@@ -207,6 +207,12 @@ impl Db {
     /// Train product quantization on the current contents (L2 only) and
     /// encode every stored vector. Later inserts are encoded on the fly.
     /// `m` subquantizers of 256 centroids: `dim/m*4 : 1` compression.
+    ///
+    /// The k-means runs unlocked -- it only needs a sample, and rows already
+    /// appended never move -- but encoding and publishing happen together
+    /// under the exclusive maintenance lock, so `codes` always covers exactly
+    /// the store that `search_pq` will traverse. Concurrent inserts block only
+    /// for the encode, not for the training.
     pub fn train_pq(&self, m: usize, iters: usize, max_samples: usize) -> Result<()> {
         if self.index.config().metric != Metric::L2 {
             return Err(Error::Corrupt("PQ supports L2 only in v1".into()));
@@ -227,9 +233,37 @@ impl Db {
         let mut rng = SmallRng::from_entropy();
         let pq = ProductQuantizer::train(&samples, dim, m, iters, &mut rng);
 
+        // Exclusive: an insert landing between encode_all reading store.len()
+        // and this publish would see `pq == None`, write no code, and then be
+        // searched against codes that don't describe it.
+        let _exclusive = self.maintenance.write();
         let codes = encode_all(&pq, &self.store);
         *self.pq.write() = Some(PqState { pq, codes });
         Ok(())
+    }
+
+    /// Ids whose stored PQ code disagrees with a fresh encode of their
+    /// vector, plus `(codes covered, store len)`. The invariant `search_pq`
+    /// depends on: every id the graph can return has a real code. A missed
+    /// insert shows up either as short coverage or as a zero-filled code.
+    #[cfg(test)]
+    fn pq_inconsistent_ids(&self) -> Option<(Vec<u64>, usize, usize)> {
+        let state = self.pq.read();
+        let state = state.as_ref()?;
+        let m = state.pq.m();
+        let covered = state.codes.len() / m;
+        let stored = self.store.len();
+        let mut bad = Vec::new();
+        let mut fresh = vec![0u8; m];
+        for id in 0..covered.min(stored) {
+            state
+                .pq
+                .encode(unsafe { self.store.get_unchecked(id as u64) }, &mut fresh);
+            if fresh != state.codes[id * m..][..m] {
+                bad.push(id as u64);
+            }
+        }
+        Some((bad, covered, stored))
     }
 
     /// Approximate search over PQ codes (ADC), then re-rank the best
@@ -469,6 +503,82 @@ mod tests {
                 ((x >> 33) as u32) as f32 / u32::MAX as f32 - 0.5
             })
             .collect()
+    }
+
+    #[test]
+    fn train_pq_concurrent_with_inserts_keeps_codes_covering_the_store() {
+        // train_pq used to take no maintenance lock at all, while every other
+        // mutator does. It snapshotted store.len(), trained (slow), then
+        // published codes sized for the *old* length. Inserts landing in that
+        // window saw `pq == None`, wrote no code, and were then either indexed
+        // out of bounds by search_pq's oracle or silently scored as centroid 0
+        // in every subspace.
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const SEED: usize = 60_000;
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 32;
+        let seed: Vec<f32> = (0..SEED * dim)
+            .map(|i| ((i * 7919) % 977) as f32 / 977.0)
+            .collect();
+        let db = Arc::new(Db::open(dir.path(), dim, DbOptions::default()).unwrap());
+        db.add_batch(&seed).unwrap();
+
+        // The writer must stay in flight for the *whole* of train_pq, because
+        // the window is between encode_all reading store.len() and the publish.
+        // A writer that finishes early (400 inserts take ~1ms, training takes
+        // seconds) never overlaps it and the bug stays invisible.
+        let done = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(Barrier::new(2));
+
+        let trainer = {
+            let (db, gate, done) = (db.clone(), gate.clone(), done.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                db.train_pq(8, 20, 100_000).unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        let writer = {
+            let (db, gate, done, written) =
+                (db.clone(), gate.clone(), done.clone(), written.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                let mut i = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    db.insert(&vec![(i % 400) as f32 / 400.0; dim]).unwrap();
+                    i += 1;
+                }
+                written.store(i, Ordering::SeqCst);
+            })
+        };
+        trainer.join().unwrap();
+        writer.join().unwrap();
+        let inserted = written.load(Ordering::SeqCst) as usize;
+        assert!(inserted > 0, "writer never overlapped training");
+
+        let (bad, covered, stored) = db.pq_inconsistent_ids().expect("pq trained");
+        assert_eq!(stored, SEED + inserted);
+        assert_eq!(
+            covered, stored,
+            "codes must cover every stored vector ({covered} codes vs {stored} vectors)"
+        );
+        assert!(
+            bad.is_empty(),
+            "{} of {stored} ids have a code that doesn't match their vector \
+             (first few: {:?}) -- inserts were dropped during training",
+            bad.len(),
+            &bad[..bad.len().min(8)]
+        );
+
+        // Every id the graph can return must be scorable: with codes short of
+        // the store this panicked inside search_pq's rayon oracle.
+        for i in [0u64, (SEED as u64) - 1, SEED as u64, (stored as u64) - 1] {
+            let v = db.get(i).unwrap().to_vec();
+            assert_eq!(db.search_pq(&v, 10, 128, 4).unwrap().len(), 10);
+        }
     }
 
     #[test]
