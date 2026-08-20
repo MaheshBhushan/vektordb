@@ -4,7 +4,7 @@
 
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     let mut acc = 0.0f32;
     for (x, y) in a.iter().zip(b.iter()) {
         let d = x - y;
@@ -15,7 +15,7 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     let mut acc = 0.0f32;
     for (x, y) in a.iter().zip(b.iter()) {
         acc += x * y;
@@ -26,7 +26,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// Cosine *distance*: 1 - cos(a, b). Zero-norm inputs yield distance 1.
 #[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     let (mut ab, mut aa, mut bb) = (0.0f32, 0.0f32, 0.0f32);
     for (x, y) in a.iter().zip(b.iter()) {
         ab += x * y;

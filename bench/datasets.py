@@ -7,14 +7,25 @@ corpus. A tiny synthetic fallback keeps the harness runnable offline.
 """
 
 import os
+import shutil
 import tarfile
 import urllib.request
 
 import numpy as np
 
-SIFT_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 SIFT_URL_HTTP = "https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main/sift.tar.gz"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+
+def _safe_extract(archive, destination):
+    root = os.path.realpath(destination)
+    for member in archive.getmembers():
+        target = os.path.realpath(os.path.join(root, member.name))
+        if os.path.commonpath((root, target)) != root:
+            raise ValueError(f"unsafe archive path: {member.name}")
+        if member.issym() or member.islnk() or member.isdev():
+            raise ValueError(f"unsafe archive member: {member.name}")
+    archive.extractall(root)
 
 
 def _read_vecs(path, view_dtype):
@@ -49,21 +60,19 @@ def download_sift():
         return base_dir
     tgz = os.path.join(DATA_DIR, "sift.tar.gz")
     if not os.path.exists(tgz):
-        last = None
-        for url in (SIFT_URL_HTTP, SIFT_URL):
-            try:
-                print(f"downloading SIFT1M from {url} ...")
-                urllib.request.urlretrieve(url, tgz)
-                last = None
-                break
-            except Exception as e:  # noqa: BLE001
-                last = e
-                print(f"  failed: {e}")
-        if last is not None:
-            raise RuntimeError(f"could not download SIFT1M: {last}")
+        part = f"{tgz}.part"
+        print(f"downloading SIFT1M from {SIFT_URL_HTTP} ...")
+        try:
+            with urllib.request.urlopen(SIFT_URL_HTTP, timeout=60) as source:
+                with open(part, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+            os.replace(part, tgz)
+        finally:
+            if os.path.exists(part):
+                os.unlink(part)
     print("extracting ...")
     with tarfile.open(tgz) as t:
-        t.extractall(DATA_DIR)
+        _safe_extract(t, DATA_DIR)
     return base_dir
 
 

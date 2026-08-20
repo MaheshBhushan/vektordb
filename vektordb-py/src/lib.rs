@@ -21,10 +21,16 @@ use pyo3::prelude::*;
 use vektordb_core::distance::Metric;
 use vektordb_core::hnsw::HnswConfig;
 use vektordb_core::wal::SyncPolicy;
-use vektordb_core::{Db, DbOptions};
+use vektordb_core::{Db, DbOptions, Error};
 
-fn err<E: std::fmt::Display>(e: E) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+fn err(e: Error) -> PyErr {
+    let message = e.to_string();
+    match e {
+        Error::DimensionMismatch { .. } | Error::IdOutOfRange(_) | Error::InvalidArgument(_) => {
+            PyValueError::new_err(message)
+        }
+        Error::Io(_) | Error::Corrupt(_) => PyRuntimeError::new_err(message),
+    }
 }
 
 /// `(ids, distances)`, both shape `(nq, k)` — what every search returns.
@@ -107,13 +113,22 @@ impl VektorDb {
             return Err(PyValueError::new_err("query dim mismatch"));
         }
         let nq = queries.shape()[0];
+        if k == 0 {
+            return Ok((
+                rows_u64(py, Vec::new(), nq, 0)?,
+                rows_f32(py, Vec::new(), nq, 0)?,
+            ));
+        }
+        let output_len = nq
+            .checked_mul(k)
+            .ok_or_else(|| PyValueError::new_err("query count * k overflows"))?;
         let flat = queries.as_slice()?.to_vec();
         let dim = self.dim;
 
         let (ids, dists) = py.allow_threads(|| {
             use rayon::prelude::*;
-            let mut ids = vec![u64::MAX; nq * k];
-            let mut dists = vec![f32::INFINITY; nq * k];
+            let mut ids = vec![u64::MAX; output_len];
+            let mut dists = vec![f32::INFINITY; output_len];
             ids.par_chunks_mut(k)
                 .zip(dists.par_chunks_mut(k))
                 .enumerate()
@@ -146,14 +161,23 @@ impl VektorDb {
             return Err(PyValueError::new_err("query dim mismatch"));
         }
         let nq = queries.shape()[0];
+        if k == 0 {
+            return Ok((
+                rows_u64(py, Vec::new(), nq, 0)?,
+                rows_f32(py, Vec::new(), nq, 0)?,
+            ));
+        }
+        let output_len = nq
+            .checked_mul(k)
+            .ok_or_else(|| PyValueError::new_err("query count * k overflows"))?;
         let flat = queries.as_slice()?.to_vec();
         let dim = self.dim;
 
         let (ids, dists) = py
             .allow_threads(|| {
                 use rayon::prelude::*;
-                let mut ids = vec![u64::MAX; nq * k];
-                let mut dists = vec![f32::INFINITY; nq * k];
+                let mut ids = vec![u64::MAX; output_len];
+                let mut dists = vec![f32::INFINITY; output_len];
                 ids.par_chunks_mut(k)
                     .zip(dists.par_chunks_mut(k))
                     .enumerate()

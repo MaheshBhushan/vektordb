@@ -10,6 +10,8 @@ pub enum Error {
     DimensionMismatch { expected: usize, got: usize },
     #[error("vector id {0} out of range")]
     IdOutOfRange(u64),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

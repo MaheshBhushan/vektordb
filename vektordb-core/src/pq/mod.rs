@@ -15,6 +15,7 @@ use rand::Rng;
 use rayon::prelude::*;
 
 use crate::distance::scalar::l2_squared;
+use crate::error::{Error, Result};
 
 pub const K: usize = 256; // centroids per subspace, one byte per code
 
@@ -43,11 +44,29 @@ impl ProductQuantizer {
 
     /// Train codebooks on `samples` (row-major, `dim` floats each).
     /// `dim` must be divisible by `m`.
-    pub fn train<R: Rng>(samples: &[f32], dim: usize, m: usize, iters: usize, rng: &mut R) -> Self {
-        assert!(dim.is_multiple_of(m), "dim {dim} not divisible by m {m}");
-        assert!(!samples.is_empty() && samples.len().is_multiple_of(dim));
+    pub fn train<R: Rng>(
+        samples: &[f32],
+        dim: usize,
+        m: usize,
+        iters: usize,
+        rng: &mut R,
+    ) -> Result<Self> {
+        if dim == 0 || m == 0 || !dim.is_multiple_of(m) {
+            return Err(Error::InvalidArgument(format!(
+                "PQ m must be a non-zero divisor of dimension {dim}"
+            )));
+        }
+        if samples.is_empty() || !samples.len().is_multiple_of(dim) {
+            return Err(Error::InvalidArgument(
+                "PQ samples must contain complete, non-empty rows".into(),
+            ));
+        }
         let n = samples.len() / dim;
-        assert!(n >= K, "need at least {K} training vectors, got {n}");
+        if n < K {
+            return Err(Error::InvalidArgument(format!(
+                "need at least {K} training vectors, got {n}"
+            )));
+        }
         let sub_dim = dim / m;
 
         // Independent seed per subspace so rayon workers don't share rng.
@@ -69,12 +88,12 @@ impl ProductQuantizer {
             })
             .collect();
 
-        Self {
+        Ok(Self {
             dim,
             m,
             sub_dim,
             centroids,
-        }
+        })
     }
 
     /// Quantize `v` into `out` (`m` bytes).
@@ -285,7 +304,7 @@ mod tests {
         let dim = 32;
         let data = blobs(4000, dim, 9);
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        let pq = ProductQuantizer::train(&data, dim, 8, 15, &mut rng);
+        let pq = ProductQuantizer::train(&data, dim, 8, 15, &mut rng).unwrap();
 
         let mut code = vec![0u8; 8];
         let mut mse = 0.0f64;
@@ -317,7 +336,7 @@ mod tests {
         let dim = 16;
         let data = blobs(2000, dim, 4);
         let mut rng = rand::rngs::StdRng::seed_from_u64(2);
-        let pq = ProductQuantizer::train(&data, dim, 4, 10, &mut rng);
+        let pq = ProductQuantizer::train(&data, dim, 4, 10, &mut rng).unwrap();
 
         let mut code = vec![0u8; 4];
         for t in 0..50 {
@@ -339,7 +358,7 @@ mod tests {
         let dim = 16;
         let data = blobs(1000, dim, 8);
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        let pq = ProductQuantizer::train(&data, dim, 4, 5, &mut rng);
+        let pq = ProductQuantizer::train(&data, dim, 4, 5, &mut rng).unwrap();
         let restored = ProductQuantizer::from_bytes(&pq.to_bytes()).unwrap();
         assert_eq!(restored.m(), pq.m());
         assert_eq!(restored.dim(), pq.dim());
@@ -362,7 +381,9 @@ mod tests {
         let dim = 16;
         let data = blobs(1000, dim, 8);
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        let good = ProductQuantizer::train(&data, dim, 4, 5, &mut rng).to_bytes();
+        let good = ProductQuantizer::train(&data, dim, 4, 5, &mut rng)
+            .unwrap()
+            .to_bytes();
 
         let hdr = |dim: u32, m: u32, sub_dim: u32| {
             let mut v = Vec::new();
