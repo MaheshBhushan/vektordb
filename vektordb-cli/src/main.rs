@@ -71,6 +71,11 @@ fn ingest(
     count: u64,
     checkpoint_every: Option<u64>,
 ) -> vektordb_core::Result<()> {
+    if checkpoint_every == Some(0) {
+        return Err(vektordb_core::Error::InvalidArgument(
+            "checkpoint_every must be greater than zero".into(),
+        ));
+    }
     let db = Db::open(dir, dim, DbOptions::default())?;
     let start = db.len() as u64;
     let stdout = std::io::stdout();
@@ -78,8 +83,8 @@ fn ingest(
         let id = db.insert(&vec_for_id(i, dim))?;
         // The ACK line is the durability promise; flush it immediately.
         let mut out = stdout.lock();
-        writeln!(out, "ACK {id}").ok();
-        out.flush().ok();
+        writeln!(out, "ACK {id}")?;
+        out.flush()?;
         if let Some(every) = checkpoint_every {
             if (i + 1) % every == 0 {
                 db.checkpoint()?;

@@ -103,10 +103,17 @@ impl Db {
         let (index, replay_from) = if snap_path.exists() {
             Hnsw::load(&snap_path)?
         } else {
-            (Hnsw::new(opts.config), 0)
+            (Hnsw::new(opts.config)?, 0)
         };
 
-        let wal = if opts.enable_wal {
+        // Disabling future logging must never disable recovery of records
+        // already acknowledged by an earlier durable session.
+        let recover_wal = opts.enable_wal
+            || wal_path
+                .metadata()
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false);
+        let wal = if recover_wal {
             let (mut wal, records) = Wal::open(&wal_path, opts.sync)?;
             wal.ensure_lsn_at_least(replay_from);
             for (lsn, op) in records {
@@ -123,22 +130,30 @@ impl Db {
                         "WAL skips store id {}",
                         store.len()
                     )));
+                } else if store.get(id)? != vector.as_slice() {
+                    return Err(Error::Corrupt(format!(
+                        "WAL vector {id} disagrees with vector store"
+                    )));
                 }
-                if (id as usize) >= index.len() {
+                if (id as usize) == index.len() {
                     index.insert(&store, id, &mut level_rng(id));
+                } else if (id as usize) > index.len() {
+                    return Err(Error::Corrupt(format!(
+                        "WAL skips index id {}",
+                        index.len()
+                    )));
                 }
             }
-            Some(Mutex::new(wal))
+            opts.enable_wal.then(|| Mutex::new(wal))
         } else {
             None
         };
         if index.len() != store.len() {
-            // Rows flushed by the store but never WAL-acked (crash between
-            // mmap writeback and fsync) are unreachable; that is fine — they
-            // were never acknowledged. But the index can't exceed the store.
-            if index.len() > store.len() {
-                return Err(Error::Corrupt("index ahead of vector store".into()));
-            }
+            return Err(Error::Corrupt(format!(
+                "index/store length mismatch: index has {}, store has {}",
+                index.len(),
+                store.len()
+            )));
         }
 
         // After replay, so the codes we derive cover every recovered vector.
@@ -181,11 +196,15 @@ impl Db {
                 // identically; fsync happens inside so an ack implies
                 // durability.
                 let mut wal = wal.lock();
+                wal.ensure_healthy()?;
                 let id = self.store.append(vector)?;
-                wal.append(&WalOp::Insert {
+                if let Err(write_error) = wal.append(&WalOp::Insert {
                     id,
                     vector: vector.to_vec(),
-                })?;
+                }) {
+                    self.store.rollback_last(id)?;
+                    return Err(write_error);
+                }
                 id
             }
             None => self.store.append(vector)?,
@@ -219,6 +238,17 @@ impl Db {
         }
         let n = self.store.len();
         let dim = self.store.dim();
+        if m == 0 || !dim.is_multiple_of(m) {
+            return Err(Error::InvalidArgument(format!(
+                "PQ m must be a non-zero divisor of dimension {dim}"
+            )));
+        }
+        if max_samples < crate::pq::K {
+            return Err(Error::InvalidArgument(format!(
+                "max_samples must be at least {}",
+                crate::pq::K
+            )));
+        }
         if n < crate::pq::K {
             return Err(Error::Corrupt(format!(
                 "need >= {} vectors to train PQ",
@@ -231,7 +261,7 @@ impl Db {
             samples.extend_from_slice(unsafe { self.store.get_unchecked(id as u64) });
         }
         let mut rng = SmallRng::from_entropy();
-        let pq = ProductQuantizer::train(&samples, dim, m, iters, &mut rng);
+        let pq = ProductQuantizer::train(&samples, dim, m, iters, &mut rng)?;
 
         // Exclusive: an insert landing between encode_all reading store.len()
         // and this publish would see `pq == None`, write no code, and then be
@@ -288,7 +318,12 @@ impl Db {
         };
         let m = state.pq.m();
         let table = state.pq.adc_table(query);
-        let fetch = if rerank == 0 { k } else { k * rerank };
+        let fetch = if rerank == 0 {
+            k
+        } else {
+            k.checked_mul(rerank)
+                .ok_or_else(|| Error::InvalidArgument("k * rerank overflows".into()))?
+        };
         let mut hits = self.index.search_with_oracle(
             |id| adc_distance(&table, &state.codes[id as usize * m..][..m]),
             fetch,
@@ -328,6 +363,7 @@ impl Db {
         match &self.wal {
             Some(wal) => {
                 let mut wal = wal.lock();
+                wal.ensure_healthy()?;
                 self.index.save(&self.snap_path, wal.next_lsn())?;
                 wal.reset()?;
             }
@@ -345,17 +381,38 @@ impl Db {
     /// already-mapped rows; graph inserts run concurrently through the
     /// lock-free path.
     pub fn add_batch(&self, batch: &[f32]) -> Result<u64> {
-        use rayon::prelude::*;
+        let _exclusive = self.maintenance.write();
         let dim = self.store.dim();
-        assert_eq!(batch.len() % dim, 0, "batch not a multiple of dim");
+        if !batch.len().is_multiple_of(dim) {
+            return Err(Error::InvalidArgument(format!(
+                "batch length {} is not a multiple of dimension {dim}",
+                batch.len()
+            )));
+        }
         let base = self.store.len() as u64;
 
         // Phase 1: append rows (+ WAL) sequentially to fix the id order.
+        let mut inserted = 0usize;
         for row in batch.chunks_exact(dim) {
-            self.insert_row_storage_only(row)?;
+            match self.insert_row_storage_only(row) {
+                Ok(id) => {
+                    debug_assert_eq!(id, base + inserted as u64);
+                    inserted += 1;
+                }
+                Err(error) => {
+                    self.finish_batch(base, inserted);
+                    return Err(error);
+                }
+            }
         }
+        self.finish_batch(base, inserted);
+        Ok(base)
+    }
+
+    fn finish_batch(&self, base: u64, n: usize) {
+        use rayon::prelude::*;
+
         // Phase 2: build graph links in parallel.
-        let n = batch.len() / dim;
         (0..n as u64).into_par_iter().for_each(|i| {
             let id = base + i;
             self.index.insert(&self.store, id, &mut level_rng(id));
@@ -371,18 +428,21 @@ impl Db {
                     pq.encode(unsafe { self.store.get_unchecked(base + i as u64) }, out);
                 });
         }
-        Ok(base)
     }
 
     fn insert_row_storage_only(&self, vector: &[f32]) -> Result<u64> {
         match &self.wal {
             Some(wal) => {
                 let mut wal = wal.lock();
+                wal.ensure_healthy()?;
                 let id = self.store.append(vector)?;
-                wal.append(&WalOp::Insert {
+                if let Err(write_error) = wal.append(&WalOp::Insert {
                     id,
                     vector: vector.to_vec(),
-                })?;
+                }) {
+                    self.store.rollback_last(id)?;
+                    return Err(write_error);
+                }
                 Ok(id)
             }
             None => self.store.append(vector),
@@ -868,5 +928,106 @@ mod tests {
         drop(db);
         let db = Db::open(dir.path(), dim, DbOptions::default()).unwrap();
         assert_eq!(db.len(), 1000);
+    }
+
+    #[test]
+    fn non_durable_open_still_recovers_existing_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = vec_for(0, 8);
+        {
+            let db = Db::open(dir.path(), 8, DbOptions::default()).unwrap();
+            db.insert(&expected).unwrap();
+        }
+
+        let db = Db::open(
+            dir.path(),
+            8,
+            DbOptions {
+                enable_wal: false,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.get(0).unwrap(), expected);
+    }
+
+    #[test]
+    fn index_store_gap_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = VectorStore::create(dir.path().join("vectors.store"), 8).unwrap();
+            store.append(&[1.0; 8]).unwrap();
+            store.flush().unwrap();
+        }
+        let result = Db::open(
+            dir.path(),
+            8,
+            DbOptions {
+                enable_wal: false,
+                ..DbOptions::default()
+            },
+        );
+        let message = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("index/store gap must be rejected"),
+        };
+        assert!(message.contains("length mismatch"));
+    }
+
+    #[test]
+    fn concurrent_batches_receive_disjoint_dense_ranges() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), 8, DbOptions::default()).unwrap());
+        let gate = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for value in [1.0f32, 2.0] {
+            let db = db.clone();
+            let gate = gate.clone();
+            workers.push(std::thread::spawn(move || {
+                let batch = vec![value; 256 * 8];
+                gate.wait();
+                (db.add_batch(&batch).unwrap(), value)
+            }));
+        }
+        gate.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        assert_eq!(db.len(), 512);
+        let mut bases: Vec<_> = results.iter().map(|(base, _)| *base).collect();
+        bases.sort_unstable();
+        assert_eq!(bases, [0, 256]);
+        for (base, value) in results {
+            for id in base..base + 256 {
+                assert_eq!(db.get(id).unwrap(), &[value; 8]);
+            }
+        }
+        db.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn fallible_public_inputs_return_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), 8, DbOptions::default()).unwrap();
+        assert!(matches!(
+            db.add_batch(&[0.0; 7]),
+            Err(Error::InvalidArgument(_))
+        ));
+        for id in 0..crate::pq::K as u64 {
+            db.insert(&vec_for(id, 8)).unwrap();
+        }
+        assert!(matches!(
+            db.train_pq(0, 1, crate::pq::K),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            db.train_pq(2, 1, crate::pq::K - 1),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 }

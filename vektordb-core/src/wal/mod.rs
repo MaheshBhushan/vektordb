@@ -49,6 +49,7 @@ pub struct Wal {
     file: File,
     policy: SyncPolicy,
     next_lsn: u64,
+    poisoned: bool,
 }
 
 impl Wal {
@@ -73,19 +74,20 @@ impl Wal {
                 match read_record(&mut reader, len, good_end) {
                     Step::Record { consumed, lsn, op } => {
                         good_end += consumed;
-                        next_lsn = next_lsn.max(lsn + 1);
+                        let following = lsn
+                            .checked_add(1)
+                            .ok_or_else(|| Error::Corrupt("wal: LSN overflow".into()))?;
+                        next_lsn = next_lsn.max(following);
                         records.push((lsn, op));
                     }
                     Step::Stopped(Stop::Eof) | Step::Stopped(Stop::Torn) => break,
                     Step::Stopped(Stop::Corrupt(why)) => {
-                        // Refusing to open is the whole point: the records
-                        // after this one were acked, and truncating to
-                        // `good_end` would destroy them irrecoverably.
+                        // A complete invalid frame may already have been
+                        // acknowledged. Never turn ambiguity into data loss.
                         return Err(Error::Corrupt(format!(
-                            "wal: {why} at byte offset {good_end}, with {} intact \
-                             record(s) before it and more data after it; this is \
-                             damage to already-acked records, not a torn tail from \
-                             a crash. Refusing to truncate.",
+                            "wal: {why} at byte offset {good_end}, after {} intact \
+                             record(s); the frame is complete but invalid and may \
+                             have been acknowledged. Refusing to truncate.",
                             records.len()
                         )));
                     }
@@ -102,6 +104,7 @@ impl Wal {
                 file,
                 policy,
                 next_lsn,
+                poisoned: false,
             },
             records,
         ))
@@ -109,6 +112,15 @@ impl Wal {
 
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
+    }
+
+    pub fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Corrupt(
+                "WAL is unavailable after an I/O failure; reopen the database".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Floor the LSN counter. Called with the snapshot watermark on open:
@@ -124,6 +136,7 @@ impl Wal {
     /// Append one record. Returns its LSN after the configured sync — once
     /// this returns under `SyncPolicy::Always`, the record is durable.
     pub fn append(&mut self, op: &WalOp) -> Result<u64> {
+        self.ensure_healthy()?;
         let lsn = self.next_lsn;
         let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(&lsn.to_le_bytes());
@@ -131,7 +144,9 @@ impl Wal {
             WalOp::Insert { id, vector } => {
                 payload.push(OP_INSERT);
                 payload.extend_from_slice(&id.to_le_bytes());
-                payload.extend_from_slice(&(vector.len() as u32).to_le_bytes());
+                let dim = u32::try_from(vector.len())
+                    .map_err(|_| Error::InvalidArgument("WAL vector is too large".into()))?;
+                payload.extend_from_slice(&dim.to_le_bytes());
                 for x in vector {
                     payload.extend_from_slice(&x.to_le_bytes());
                 }
@@ -139,12 +154,21 @@ impl Wal {
         }
         let crc = crc32fast::hash(&payload);
         let mut frame = Vec::with_capacity(8 + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| Error::InvalidArgument("WAL record is too large".into()))?;
+        frame.extend_from_slice(&payload_len.to_le_bytes());
         frame.extend_from_slice(&crc.to_le_bytes());
         frame.extend_from_slice(&payload);
-        self.file.write_all(&frame)?;
-        if self.policy == SyncPolicy::Always {
-            self.file.sync_data()?;
+        let written = self.file.write_all(&frame).and_then(|_| {
+            if self.policy == SyncPolicy::Always {
+                self.file.sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = written {
+            self.poisoned = true;
+            return Err(e.into());
         }
         self.next_lsn += 1;
         Ok(lsn)
@@ -154,14 +178,25 @@ impl Wal {
     /// LSNs keep increasing across resets so the snapshot watermark stays
     /// unambiguous.
     pub fn reset(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_data()?;
+        self.ensure_healthy()?;
+        let reset = self
+            .file
+            .set_len(0)
+            .and_then(|_| self.file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|_| self.file.sync_data());
+        if let Err(error) = reset {
+            self.poisoned = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()?;
+        self.ensure_healthy()?;
+        if let Err(error) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 }
@@ -170,11 +205,10 @@ impl Wal {
 enum Stop {
     /// Clean end of the log.
     Eof,
-    /// Incomplete or damaged frame that is the *last* thing in the file:
-    /// a crash mid-write. Safe to truncate — it was never acked.
+    /// Incomplete frame at the end of the file: a crash mid-write. Safe to
+    /// truncate because `sync_data` could not have completed for this frame.
     Torn,
-    /// Damaged frame with more data after it: it was acked, then rotted.
-    /// Truncating would destroy acked records, so this fails recovery.
+    /// A complete frame that fails structural or checksum validation.
     Corrupt(&'static str),
 }
 
@@ -214,16 +248,9 @@ fn read_record<R: Read>(reader: &mut R, file_len: u64, pos: u64) -> Step {
         return Stopped(Stop::Torn); // payload truncated by the crash
     }
 
-    // The frame is wholly inside the file. From here on, "is this the last
-    // frame?" is what separates a torn tail from real corruption.
-    let is_tail = pos + 8 + len == file_len;
-    let damaged = |why: &'static str| {
-        Stopped(if is_tail {
-            Stop::Torn
-        } else {
-            Stop::Corrupt(why)
-        })
-    };
+    // The frame is wholly inside the file. Any validation failure from here
+    // is corruption, even at EOF: the frame may have been acknowledged.
+    let damaged = |why: &'static str| Stopped(Stop::Corrupt(why));
 
     let mut payload = vec![0u8; len as usize];
     if reader.read_exact(&mut payload).is_err() {
@@ -355,11 +382,10 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_last_record_is_treated_as_a_torn_tail() {
-        // A crash can leave the final frame full-length but with garbage in
-        // it (sectors persisted out of order). Nothing follows it, so it was
-        // never acked and truncating is correct -- this is the case that must
-        // NOT become an error, or every real crash would refuse to reopen.
+    fn corrupt_last_complete_record_is_not_truncated() {
+        // A full frame may already have been acknowledged. Without a separate
+        // commit marker, silently truncating it would turn corruption into
+        // acknowledged data loss, so recovery must stop and preserve the log.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
@@ -375,10 +401,13 @@ mod tests {
         bytes[last + 12] ^= 0xFF; // corrupt the tail frame's payload
         std::fs::write(&path, &bytes).unwrap();
 
-        let (mut wal, recs) = Wal::open(&path, SyncPolicy::Always).unwrap();
-        assert_eq!(recs.len(), 9, "torn tail dropped, earlier records kept");
-        assert_eq!(wal.next_lsn(), 9);
-        wal.append(&op(99)).unwrap(); // and the log still works
+        let before = std::fs::read(&path).unwrap();
+        let msg = match Wal::open(&path, SyncPolicy::Always) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a corrupt complete tail record must be rejected"),
+        };
+        assert!(msg.contains("checksum mismatch"), "unhelpful error: {msg}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -399,5 +428,24 @@ mod tests {
         let (_, recs) = Wal::open(&path, SyncPolicy::Always).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].0, 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_failure_poisons_the_wal() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut wal = Wal {
+            file,
+            policy: SyncPolicy::Never,
+            next_lsn: 0,
+            poisoned: false,
+        };
+        assert!(wal.append(&op(0)).is_err());
+        let message = wal.append(&op(1)).unwrap_err().to_string();
+        assert!(message.contains("reopen the database"));
     }
 }

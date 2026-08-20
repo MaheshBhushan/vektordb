@@ -64,7 +64,7 @@ cd vektordb-py && maturin develop --release
 import numpy as np, vektordb
 
 db = vektordb.VektorDb("mydb", dim=128, m=16, ef_construction=200, durable=True)
-db.add(np.random.rand(10_000, 128).astype(np.float32))   # returns count inserted
+db.add(np.random.rand(10_000, 128).astype(np.float32))   # returns first inserted id
 
 queries = np.random.rand(5, 128).astype(np.float32)
 ids, dists = db.search(queries, k=10, ef=64)
@@ -151,6 +151,7 @@ On disk, a database is a directory:
 mydb/
   vectors.store   fixed-stride, 64-byte-aligned mmap of raw f32 vectors
   index.snap      HNSW checkpoint (temp+rename, CRC-checked)
+  pq.codebook     PQ centroids, present after training + checkpoint
   wal             append-only insert log since the last checkpoint
 ```
 

@@ -93,14 +93,36 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
 }
 
 impl VectorStore {
-    fn seg_byte_offset(&self, seg: usize) -> u64 {
-        HEADER_SIZE + BASE_ROWS * ((1u64 << seg) - 1) * self.row_stride as u64
+    fn seg_byte_offset(&self, seg: usize) -> Result<u64> {
+        let rows_before = BASE_ROWS
+            .checked_mul((1u64 << seg) - 1)
+            .ok_or_else(|| Error::Corrupt("store geometry overflows".into()))?;
+        HEADER_SIZE
+            .checked_add(
+                rows_before
+                    .checked_mul(self.row_stride as u64)
+                    .ok_or_else(|| Error::Corrupt("store geometry overflows".into()))?,
+            )
+            .ok_or_else(|| Error::Corrupt("store geometry overflows".into()))
     }
 
-    fn map_segment(file: &File, byte_offset: u64, rows: u64, stride: usize) -> Result<MmapMut> {
-        let len = rows as usize * stride;
-        let end = byte_offset + len as u64;
+    fn map_segment(
+        file: &File,
+        byte_offset: u64,
+        rows: u64,
+        stride: usize,
+        extend: bool,
+    ) -> Result<MmapMut> {
+        let len = (rows as usize)
+            .checked_mul(stride)
+            .ok_or_else(|| Error::Corrupt("store geometry overflows".into()))?;
+        let end = byte_offset
+            .checked_add(len as u64)
+            .ok_or_else(|| Error::Corrupt("store geometry overflows".into()))?;
         if file.metadata()?.len() < end {
+            if !extend {
+                return Err(Error::Corrupt("vector store is truncated".into()));
+            }
             file.set_len(end)?;
         }
         Ok(unsafe {
@@ -113,14 +135,23 @@ impl VectorStore {
 
     /// Create a new store file (truncating any existing one).
     pub fn create<P: AsRef<Path>>(path: P, dim: usize) -> Result<Self> {
-        assert!(dim > 0, "dimension must be positive");
+        if dim == 0 || dim > u32::MAX as usize {
+            return Err(Error::InvalidArgument(
+                "dimension must be in 1..=u32::MAX".into(),
+            ));
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)?;
-        let row_stride = (dim * 4).div_ceil(ROW_ALIGN) * ROW_ALIGN;
+        let row_bytes = dim
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidArgument("dimension is too large".into()))?;
+        let row_stride = row_bytes
+            .checked_next_multiple_of(ROW_ALIGN)
+            .ok_or_else(|| Error::InvalidArgument("dimension is too large".into()))?;
         file.set_len(HEADER_SIZE)?;
         let mut header = unsafe {
             MmapOptions::new()
@@ -142,7 +173,7 @@ impl VectorStore {
             row_stride,
             count: AtomicU64::new(0),
         };
-        store.ensure_mapped_locked(&mut store.appender.lock(), 1)?;
+        store.ensure_mapped_locked(&mut store.appender.lock(), 1, true)?;
         Ok(store)
     }
 
@@ -166,7 +197,10 @@ impl VectorStore {
         let dim = read_u32(&header, OFF_DIM) as usize;
         let row_stride = read_u64(&header, OFF_STRIDE) as usize;
         let count = read_u64(&header, OFF_COUNT);
-        if dim == 0 || row_stride < dim * 4 || !row_stride.is_multiple_of(ROW_ALIGN) {
+        let row_bytes = dim
+            .checked_mul(4)
+            .ok_or_else(|| Error::Corrupt("inconsistent header geometry".into()))?;
+        if dim == 0 || row_stride < row_bytes || !row_stride.is_multiple_of(ROW_ALIGN) {
             return Err(Error::Corrupt("inconsistent header geometry".into()));
         }
 
@@ -181,11 +215,11 @@ impl VectorStore {
         // Map every segment that contains existing rows (plus segment 0).
         let (last_seg, _) = locate(count.saturating_sub(1));
         let needed = if count == 0 { 1 } else { last_seg + 1 };
-        store.ensure_mapped_locked(&mut store.appender.lock(), needed)?;
+        store.ensure_mapped_locked(&mut store.appender.lock(), needed, false)?;
         Ok(store)
     }
 
-    fn ensure_mapped_locked(&self, app: &mut Appender, upto: usize) -> Result<()> {
+    fn ensure_mapped_locked(&self, app: &mut Appender, upto: usize, extend: bool) -> Result<()> {
         if upto > MAX_SEGMENTS {
             return Err(Error::Corrupt("store exceeds maximum size".into()));
         }
@@ -193,9 +227,10 @@ impl VectorStore {
             let seg = app.mapped;
             let map = Self::map_segment(
                 &app.file,
-                self.seg_byte_offset(seg),
+                self.seg_byte_offset(seg)?,
                 seg_rows(seg),
                 self.row_stride,
+                extend,
             )?;
             self.segments[seg]
                 .set(map)
@@ -228,7 +263,7 @@ impl VectorStore {
         let mut app = self.appender.lock();
         let id = self.count.load(Ordering::Relaxed);
         let (seg, row) = locate(id);
-        self.ensure_mapped_locked(&mut app, seg + 1)?;
+        self.ensure_mapped_locked(&mut app, seg + 1, true)?;
 
         let map = self.segments[seg].get().unwrap();
         let off = row as usize * self.row_stride;
@@ -244,6 +279,19 @@ impl VectorStore {
         // Release-publish the new count after the row bytes are visible.
         self.count.store(id + 1, Ordering::Release);
         Ok(id)
+    }
+
+    /// Undo the most recent unpublished append after a WAL failure.
+    pub(crate) fn rollback_last(&self, id: u64) -> Result<()> {
+        let _app = self.appender.lock();
+        let count = self.count.load(Ordering::Acquire);
+        if count != id + 1 {
+            return Err(Error::Corrupt(format!(
+                "cannot roll back store id {id} at count {count}"
+            )));
+        }
+        self.count.store(id, Ordering::Release);
+        Ok(())
     }
 
     /// Zero-copy read of a vector straight out of the mapping. The returned
@@ -398,5 +446,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), 16).unwrap();
         assert!(store.append(&[0.0; 8]).is_err());
+    }
+
+    #[test]
+    fn truncated_existing_store_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.store");
+        {
+            let store = VectorStore::create(&path, 8).unwrap();
+            store.append(&[1.0; 8]).unwrap();
+            store.flush().unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(HEADER_SIZE)
+            .unwrap();
+
+        let message = match VectorStore::open(&path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("truncated store must be rejected"),
+        };
+        assert!(message.contains("truncated"), "unhelpful error: {message}");
+    }
+
+    #[test]
+    fn overflowing_header_geometry_is_rejected() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.store");
+        drop(VectorStore::create(&path, 1).unwrap());
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(OFF_COUNT as u64)).unwrap();
+        file.write_all(&2u64.to_le_bytes()).unwrap();
+        file.seek(SeekFrom::Start(OFF_STRIDE as u64)).unwrap();
+        file.write_all(&(1u64 << 54).to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+
+        let message = match VectorStore::open(&path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("overflowing store geometry must be rejected"),
+        };
+        assert!(message.contains("overflows"), "unhelpful error: {message}");
+    }
+
+    #[test]
+    fn rollback_removes_only_the_latest_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::create(dir.path().join("v.store"), 4).unwrap();
+        assert_eq!(store.append(&[1.0; 4]).unwrap(), 0);
+        assert_eq!(store.append(&[2.0; 4]).unwrap(), 1);
+        store.rollback_last(1).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(matches!(store.get(1), Err(Error::IdOutOfRange(1))));
     }
 }

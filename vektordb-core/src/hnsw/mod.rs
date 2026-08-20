@@ -40,6 +40,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 
 use crate::distance::{DistanceFn, Metric};
+use crate::error::{Error, Result};
 use crate::storage::exact::push_bounded;
 use crate::storage::{Neighbor, VectorStore};
 
@@ -126,16 +127,18 @@ pub struct Hnsw {
 }
 
 impl Hnsw {
-    pub fn new(config: HnswConfig) -> Self {
-        assert!(config.m >= 2, "M must be at least 2");
-        Self {
+    pub fn new(config: HnswConfig) -> Result<Self> {
+        if !(2..=4096).contains(&config.m) {
+            return Err(Error::InvalidArgument("HNSW M must be in 2..=4096".into()));
+        }
+        Ok(Self {
             kernel: config.metric.kernel(),
             ml: 1.0 / (config.m as f64).ln(),
             config,
             nodes: SegVec::new(),
             entry: AtomicU64::new(ENTRY_NONE),
             entry_lock: Mutex::new(()),
-        }
+        })
     }
 
     pub fn config(&self) -> &HnswConfig {
@@ -545,7 +548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), dim).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let index = Hnsw::new(config);
+        let index = Hnsw::new(config).unwrap();
         let centers = make_centers(dim, &mut rng);
         for _ in 0..n {
             let v = sample_blob(&centers, &mut rng);
@@ -629,7 +632,8 @@ mod tests {
             m: 16,
             ef_construction: 200,
             metric: Metric::L2,
-        });
+        })
+        .unwrap();
         let centers = make_centers(dim, &mut rng);
         for _ in 0..12_000 {
             let v = sample_blob(&centers, &mut rng);
@@ -670,7 +674,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let store = VectorStore::create(dir.path().join("v.store"), dim).unwrap();
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let index = Hnsw::new(HnswConfig::default());
+            let index = Hnsw::new(HnswConfig::default()).unwrap();
             let centers = make_centers(dim, &mut rng);
             for _ in 0..n {
                 let v = sample_blob(&centers, &mut rng);
@@ -694,13 +698,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), 4).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
-        let index = Hnsw::new(HnswConfig::default());
+        let index = Hnsw::new(HnswConfig::default()).unwrap();
         assert!(index.search(&store, &[0.0; 4], 5, 32).is_empty());
         let id = store.append(&[1.0, 2.0, 3.0, 4.0]).unwrap();
         index.insert(&store, id, &mut rng);
         let got = index.search(&store, &[1.0, 2.0, 3.0, 4.0], 5, 32);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, 0);
+    }
+
+    #[test]
+    fn invalid_m_is_rejected() {
+        let result = Hnsw::new(HnswConfig {
+            m: 1,
+            ..HnswConfig::default()
+        });
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 
     /// M4 stress: concurrent inserts + concurrent lock-free searches, then
@@ -716,7 +729,8 @@ mod tests {
             m: 12,
             ef_construction: 100,
             metric: Metric::L2,
-        });
+        })
+        .unwrap();
         let mut seed_rng = rand::rngs::StdRng::seed_from_u64(77);
         let centers = make_centers(dim, &mut seed_rng);
 

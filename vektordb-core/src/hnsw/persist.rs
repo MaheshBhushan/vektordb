@@ -13,7 +13,7 @@
 //! this with its maintenance lock); loads happen before the index is shared.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -26,6 +26,33 @@ use super::{pack_entry, unpack_entry, Hnsw, HnswConfig, Node, ENTRY_NONE};
 
 const MAGIC: u32 = 0x564B_534E; // "VKSN"
 const VERSION: u32 = 1;
+
+fn verify_crc(file: &mut File) -> Result<u64> {
+    let file_len = file.metadata()?.len();
+    if file_len < 4 {
+        return Err(Error::Corrupt("snapshot: truncated".into()));
+    }
+
+    let payload_len = file_len - 4;
+    let mut reader = BufReader::new(&mut *file);
+    let mut hasher = crc32fast::Hasher::new();
+    let mut remaining = payload_len;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len() as u64) as usize;
+        reader.read_exact(&mut buf[..take])?;
+        hasher.update(&buf[..take]);
+        remaining -= take as u64;
+    }
+    let mut crc = [0u8; 4];
+    reader.read_exact(&mut crc)?;
+    if u32::from_le_bytes(crc) != hasher.finalize() {
+        return Err(Error::Corrupt("snapshot: checksum mismatch".into()));
+    }
+    drop(reader);
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file_len)
+}
 
 fn metric_tag(m: Metric) -> u8 {
     match m {
@@ -141,7 +168,10 @@ impl Hnsw {
     /// Load a snapshot. Returns the rebuilt index and the WAL LSN replay
     /// should resume from.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<(Hnsw, u64)> {
-        let file = File::open(path)?;
+        let path = path.as_ref();
+        // Verify the complete file before trusting lengths or allocating.
+        let mut file = File::open(path)?;
+        let file_len = verify_crc(&mut file)?;
         let mut r = CrcReader {
             inner: BufReader::new(file),
             hasher: crc32fast::Hasher::new(),
@@ -160,11 +190,18 @@ impl Hnsw {
         let count = r.u64()?;
         let entry = r.u64()?;
 
+        if !(2..=4096).contains(&m) {
+            return Err(Error::Corrupt("snapshot: HNSW M out of range".into()));
+        }
+        if count > file_len / 8 {
+            return Err(Error::Corrupt("snapshot: impossible node count".into()));
+        }
+
         let index = Hnsw::new(HnswConfig {
             m,
             ef_construction,
             metric,
-        });
+        })?;
         let guard = epoch::pin();
         for i in 0..count {
             let level = r.u32()? as usize;
@@ -174,7 +211,8 @@ impl Hnsw {
             let node = Node::new(level);
             for layer in 0..=level {
                 let len = r.u32()? as usize;
-                if len > 4 * m.max(1) + 64 {
+                let max_degree = if layer == 0 { 2 * m } else { m };
+                if len > max_degree {
                     return Err(Error::Corrupt("snapshot: absurd degree".into()));
                 }
                 let mut links = Vec::with_capacity(len);
@@ -199,11 +237,18 @@ impl Hnsw {
         if u32::from_le_bytes(crc_buf) != expected {
             return Err(Error::Corrupt("snapshot: checksum mismatch".into()));
         }
+        let mut trailing = [0u8; 1];
+        if r.inner.read(&mut trailing)? != 0 {
+            return Err(Error::Corrupt("snapshot: trailing bytes".into()));
+        }
 
         if entry != ENTRY_NONE {
             let (id, level) = unpack_entry(entry);
             if id >= count {
                 return Err(Error::Corrupt("snapshot: entry out of range".into()));
+            }
+            if level != index.node(id).level() {
+                return Err(Error::Corrupt("snapshot: entry level mismatch".into()));
             }
             index.entry.store(pack_entry(id, level), Ordering::Release);
         }
@@ -226,7 +271,8 @@ mod tests {
             m: 8,
             ef_construction: 64,
             metric: Metric::L2,
-        });
+        })
+        .unwrap();
         for i in 0..2000 {
             let v: Vec<f32> = (0..12).map(|j| ((i * 12 + j) % 97) as f32 * 0.1).collect();
             let id = store.append(&v).unwrap();
@@ -252,7 +298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = VectorStore::create(dir.path().join("v.store"), 4).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        let index = Hnsw::new(HnswConfig::default());
+        let index = Hnsw::new(HnswConfig::default()).unwrap();
         for i in 0..100 {
             let id = store.append(&[i as f32; 4]).unwrap();
             index.insert(&store, id, &mut rng);
@@ -267,6 +313,32 @@ mod tests {
         assert!(
             Hnsw::load(&snap).is_err(),
             "bit flip must not load silently"
+        );
+    }
+
+    #[test]
+    fn checksum_valid_snapshot_with_invalid_config_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("index.snap");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // invalid M
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.push(metric_tag(Metric::L2));
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&ENTRY_NONE.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+        std::fs::write(&snap, bytes).unwrap();
+
+        let message = match Hnsw::load(&snap) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("invalid snapshot config must be rejected"),
+        };
+        assert!(
+            message.contains("M out of range"),
+            "unhelpful error: {message}"
         );
     }
 }

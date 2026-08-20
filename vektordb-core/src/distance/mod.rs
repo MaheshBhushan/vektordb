@@ -29,16 +29,19 @@ fn dot_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 fn l2_avx2(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     unsafe { avx2::l2_squared(a, b) }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn dot_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     -unsafe { avx2::dot(a, b) }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn cosine_avx2(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
     unsafe { avx2::cosine(a, b) }
 }
 
@@ -145,5 +148,11 @@ mod tests {
             let r = scalar::l2_squared(&a, &b);
             assert_close(k(&a, &b), r, r.abs());
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "distance vectors must have equal lengths")]
+    fn safe_kernel_rejects_mismatched_lengths() {
+        Metric::L2.kernel()(&[0.0; 16], &[0.0; 8]);
     }
 }
