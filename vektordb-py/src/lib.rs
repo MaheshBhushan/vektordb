@@ -94,7 +94,7 @@ impl VektorDb {
         }
         let flat = vectors.as_slice()?; // requires C-contiguous
         let owned = flat.to_vec();
-        py.allow_threads(|| self.db.add_batch(&owned)).map_err(err)
+        py.detach(|| self.db.add_batch(&owned)).map_err(err)
     }
 
     /// Search `queries` (shape (nq, dim), float32) for the `k` nearest
@@ -125,7 +125,7 @@ impl VektorDb {
         let flat = queries.as_slice()?.to_vec();
         let dim = self.dim;
 
-        let (ids, dists) = py.allow_threads(|| {
+        let (ids, dists) = py.detach(|| {
             use rayon::prelude::*;
             let mut ids = vec![u64::MAX; output_len];
             let mut dists = vec![f32::INFINITY; output_len];
@@ -174,7 +174,7 @@ impl VektorDb {
         let dim = self.dim;
 
         let (ids, dists) = py
-            .allow_threads(|| {
+            .detach(|| {
                 use rayon::prelude::*;
                 let mut ids = vec![u64::MAX; output_len];
                 let mut dists = vec![f32::INFINITY; output_len];
@@ -200,19 +200,19 @@ impl VektorDb {
     /// Train product quantization on the current contents.
     #[pyo3(signature = (m=16, iters=25, max_samples=100_000))]
     fn train_pq(&self, py: Python<'_>, m: usize, iters: usize, max_samples: usize) -> PyResult<()> {
-        py.allow_threads(|| self.db.train_pq(m, iters, max_samples))
+        py.detach(|| self.db.train_pq(m, iters, max_samples))
             .map_err(err)
     }
 
     /// Persist a snapshot and flush the store.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.db.checkpoint()).map_err(err)
+        py.detach(|| self.db.checkpoint()).map_err(err)
     }
 
     /// Reconstruct a single stored vector (copy) as a numpy array.
     fn get<'py>(&self, py: Python<'py>, id: u64) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let v = self.db.get(id).map_err(err)?.to_vec();
-        Ok(PyArray1::from_slice_bound(py, &v))
+        Ok(PyArray1::from_slice(py, &v))
     }
 
     #[getter]
@@ -238,7 +238,7 @@ fn rows_u64(
     n: usize,
     k: usize,
 ) -> PyResult<Bound<'_, PyArray2<u64>>> {
-    PyArray1::from_slice_bound(py, &flat).reshape([n, k])
+    PyArray1::from_slice(py, &flat).reshape([n, k])
 }
 
 fn rows_f32(
@@ -247,7 +247,7 @@ fn rows_f32(
     n: usize,
     k: usize,
 ) -> PyResult<Bound<'_, PyArray2<f32>>> {
-    PyArray1::from_slice_bound(py, &flat).reshape([n, k])
+    PyArray1::from_slice(py, &flat).reshape([n, k])
 }
 
 #[pymodule]
