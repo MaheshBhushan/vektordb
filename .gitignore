@@ -3,3 +3,8 @@ bench/data/
 __pycache__/
 *.egg-info/
 .venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
