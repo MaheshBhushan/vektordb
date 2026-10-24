@@ -127,6 +127,22 @@ Numbers are machine-specific (8-core x86-64 with AVX2); the shape of the curves 
 the point.
 </details>
 
+<details>
+<summary>Batch-size import sweep (throughput, memory, recovery)</summary>
+
+```sh
+cargo run --release -p vektordb-core --example import_sweep -- \
+    --n 20000 --dim 64 --batches 1,64,1024,8192 --sync never
+```
+
+The sweep imports the same seeded dataset through `Db::add_batch` once per batch
+size. It then drops the database and reopens it from disk. Each CSV row reports
+import time, vectors/s, RSS before and after, peak RSS (`VmHWM`, reset per row on
+Linux), WAL recovery time, recovered record count and mismatched vectors. Add
+`--checkpoint` to recover from a snapshot instead of WAL replay. The command exits
+non-zero when any batch size loses or corrupts a record.
+</details>
+
 ## Architecture
 
 ```mermaid
